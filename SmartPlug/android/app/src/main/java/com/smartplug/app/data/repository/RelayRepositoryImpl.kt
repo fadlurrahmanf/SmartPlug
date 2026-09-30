@@ -56,7 +56,7 @@ class RelayRepositoryImpl @Inject constructor(
 
     private suspend fun setRelayServer(device: SmartPlugDevice, targetState: String): ApiResult<RelayCommandResult> {
         val host = device.serverHost ?: return ApiResult.Failure(ApiFailure(0, "missing_server_host"))
-        val bearer = tokenStore.serverApiToken?.let { "Bearer $it" }
+        val bearer = device.serverId?.let(tokenStore::serverApiToken)?.let { "Bearer $it" }
             ?: return ApiResult.Failure(ApiFailure(0, "missing_server_token"))
         val api = apiClientFactory.serverApi(ApiClientFactory.hostBaseUrl(host, device.serverPort))
         return safeApiCall { api.setRelay(bearer, device.deviceId, mapOf("state" to targetState)) }.map { dto ->
@@ -101,7 +101,7 @@ class RelayRepositoryImpl @Inject constructor(
         commandId: String,
     ): ApiResult<RelayCommandResult> {
         val host = device.serverHost ?: return ApiResult.Failure(ApiFailure(0, "missing_server_host"))
-        val bearer = tokenStore.serverApiToken?.let { "Bearer $it" }
+        val bearer = device.serverId?.let(tokenStore::serverApiToken)?.let { "Bearer $it" }
             ?: return ApiResult.Failure(ApiFailure(0, "missing_server_token"))
         val api = apiClientFactory.serverApi(ApiClientFactory.hostBaseUrl(host, device.serverPort))
 

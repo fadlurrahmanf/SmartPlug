@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <FS.h>
+#include <ESPmDNS.h>
 #include <Preferences.h>
 #include <SD.h>
 #include <SPI.h>
@@ -133,6 +134,8 @@ SPIClass sdSpi(VSPI);
 
 bool settingsReady = false;
 bool sdReady = false;
+bool mdnsStarted = false;
+uint32_t lastSdMountAttemptMs = 0;
 bool indexDirty = false;
 uint32_t lastIndexFlushAtMs = 0;
 uint32_t commandCounter = 0;
@@ -256,14 +259,48 @@ void loadSettings() {
 
 void startNetwork() {
   WiFi.mode(WIFI_AP_STA);
-  WiFi.softAP(kSetupApSsid, kSetupApPassword);
+  delay(100);
+  const bool apStarted = WiFi.softAP(kSetupApSsid, kSetupApPassword);
+  Serial.printf("INFO setup_ap started=%s ssid=%s ip=%s\\n",
+                apStarted ? "true" : "false", kSetupApSsid,
+                WiFi.softAPIP().toString().c_str());
   if (strlen(settings.wifiSsid) > 0) {
     WiFi.begin(settings.wifiSsid, settings.wifiPassword);
+    Serial.println(F("INFO station_connecting"));
   }
 }
 
 String stationIpText() {
   return WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : String();
+}
+
+String serverId() {
+  String id = WiFi.macAddress();
+  id.replace(":", "");
+  id.toUpperCase();
+  return String("SRV-") + id;
+}
+
+String mdnsHost() {
+  String host = String("srvrplug-") + WiFi.macAddress();
+  host.replace(":", "");
+  host.toLowerCase();
+  return host;
+}
+
+void serviceMdns() {
+  if (WiFi.status() != WL_CONNECTED || mdnsStarted) return;
+  const String host = mdnsHost();
+  if (!MDNS.begin(host.c_str())) {
+    Serial.println(F("WARN mdns_start_failed"));
+    return;
+  }
+  MDNS.addService("srvrplug", "tcp", kHttpPort);
+  MDNS.addServiceTxt("srvrplug", "tcp", "server_id", serverId());
+  MDNS.addServiceTxt("srvrplug", "tcp", "api_version", "v1");
+  MDNS.addServiceTxt("srvrplug", "tcp", "mqtt_port", String(kMqttPort));
+  mdnsStarted = true;
+  Serial.printf("INFO mdns_ready host=%s.local\\n", host.c_str());
 }
 
 void configureTimeIfConnected() {
@@ -598,10 +635,17 @@ void loadDeviceIndex() {
 }
 
 void beginStorage() {
+  lastSdMountAttemptMs = millis();
   sdSpi.begin(SERVER_SMARTPLUG_SD_SCK, SERVER_SMARTPLUG_SD_MISO,
               SERVER_SMARTPLUG_SD_MOSI, SERVER_SMARTPLUG_SD_CS);
   sdReady = SD.begin(SERVER_SMARTPLUG_SD_CS, sdSpi);
-  if (!sdReady) return;
+  if (!sdReady) {
+    Serial.println(F("WARN sd_unavailable"));
+    return;
+  }
+  const uint8_t cardType = SD.cardType();
+  Serial.printf("INFO sd_ready type=%u size_mb=%llu\\n", cardType,
+                static_cast<unsigned long long>(SD.cardSize() / (1024ULL * 1024ULL)));
   SD.mkdir("/smartplug");
   loadDeviceIndex();
 }
@@ -1236,6 +1280,13 @@ void serviceSchedules() {
 }
 
 void serviceStorage() {
+  // A card may be inserted after the ESP32 is powered. Keep retrying so the
+  // setup/status endpoint becomes useful without requiring a firmware upload
+  // or power cycle after each wiring adjustment.
+  if (!sdReady) {
+    if (millis() - lastSdMountAttemptMs >= 5000UL) beginStorage();
+    return;
+  }
   if (sdReady && indexDirty && millis() - lastIndexFlushAtMs >= kIndexFlushIntervalMs) {
     saveDeviceIndex();
   }
@@ -1565,7 +1616,8 @@ void handleSetupStatus() {
                 (strlen(settings.wifiSsid) > 0 ? "true" : "false") +
                 ",\"connected\":" + (WiFi.status() == WL_CONNECTED ? "true" : "false") +
                 ",\"ip\":\"" + stationIpText() + "\"},\"configured\":" +
-                (settingsReady ? "true" : "false") + ",\"sd_ready\":" +
+                (settingsReady ? "true" : "false") + ",\"server_id\":\"" + serverId() +
+                "\",\"mdns_host\":\"" + mdnsHost() + ".local\",\"mqtt_port\":" + String(kMqttPort) + ",\"sd_ready\":" +
                 (sdReady ? "true" : "false") + "}");
 }
 
@@ -1635,6 +1687,8 @@ void beginHttpApi() {
 
 void setup() {
   Serial.begin(115200);
+  delay(100);
+  Serial.printf("INFO server_boot version=%s\\n", kServerVersion);
   loadSettings();
   startNetwork();
   beginStorage();
@@ -1645,6 +1699,7 @@ void setup() {
 
 void loop() {
   http.handleClient();
+  serviceMdns();
   configureTimeIfConnected();
   serviceMqttBroker();
   expireCommands();

@@ -77,6 +77,7 @@ fun DeviceDetailScreen(
     var showRenameDialog by remember { mutableStateOf(false) }
     var confirmAction by remember { mutableStateOf<ConfirmAction?>(null) }
     var showTimerDialog by remember { mutableStateOf(false) }
+    var showServerConnectionDialog by remember { mutableStateOf(false) }
     var showNameLoadDialog by remember { mutableStateOf(false) }
     var nowMs by remember { mutableLongStateOf(System.currentTimeMillis()) }
     LaunchedEffect(Unit) { while (true) { nowMs = System.currentTimeMillis(); delay(1_000) } }
@@ -117,6 +118,10 @@ fun DeviceDetailScreen(
                         DropdownMenuItem(
                             text = { Text(localized(language, "Jadwal", "Schedule")) },
                             onClick = { showMenu = false; onOpenSchedule() },
+                        )
+                        DropdownMenuItem(
+                            text = { Text(localized(language, "Koneksi Server", "Server Connection")) },
+                            onClick = { showMenu = false; showServerConnectionDialog = true },
                         )
                         DropdownMenuItem(
                             text = { Text(localized(language, "Reset kWh", "Reset kWh")) },
@@ -273,6 +278,79 @@ fun DeviceDetailScreen(
             onDismiss = { showNameLoadDialog = false },
         )
     }
+    if (showServerConnectionDialog && device != null) {
+        ServerConnectionDialog(
+            device = device,
+            savedServers = uiState.registeredServers,
+            onSelectSaved = viewModel::connectSavedServer,
+            onConnect = { id, host, port, user, password, apiToken ->
+                viewModel.connectToServer(id, host, port, user, password, apiToken)
+                showServerConnectionDialog = false
+            },
+            onDisconnect = {
+                viewModel.disconnectFromServer()
+                showServerConnectionDialog = false
+            },
+            onDismiss = { showServerConnectionDialog = false },
+        )
+    }
+}
+
+/** One menu entry deliberately owns Connect, Change and Disconnect so the overflow menu stays compact. */
+@Composable
+private fun ServerConnectionDialog(
+    device: com.smartplug.app.domain.model.SmartPlugDevice,
+    savedServers: List<com.smartplug.app.domain.model.RegisteredServer>,
+    onSelectSaved: (com.smartplug.app.domain.model.RegisteredServer) -> Unit,
+    onConnect: (String, String, Int, String, String, String) -> Unit,
+    onDisconnect: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val language = LocalAppLanguage.current
+    var serverId by remember(device.serverId) { mutableStateOf(device.serverId.orEmpty()) }
+    var host by remember(device.serverHost) { mutableStateOf(device.serverHost.orEmpty()) }
+    var port by remember { mutableStateOf("1883") }
+    var username by remember { mutableStateOf("SmartPlug") }
+    var password by remember { mutableStateOf("deviotsolution") }
+    var apiToken by remember { mutableStateOf("") }
+    val connected = device.integrationMode == IntegrationMode.SERVER
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(localized(language, "Koneksi Server", "Server Connection")) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    if (connected) localized(language, "Terhubung ke ${device.serverId ?: "server"}. Ubah profil di bawah, atau putuskan untuk kembali ke Direct.", "Connected to ${device.serverId ?: "server"}. Change the profile below, or disconnect to return to Direct.")
+                    else localized(language, "Daftarkan atau hubungkan ServerSmartPlug yang sudah berada di Wi-Fi rumah yang sama.", "Register or connect a ServerSmartPlug already on the same home Wi-Fi."),
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                if (savedServers.isNotEmpty()) {
+                    Text(localized(language, "Pilih server yang tersimpan:", "Choose a saved server:"), style = MaterialTheme.typography.labelSmall)
+                    savedServers.forEach { saved ->
+                        TextButton(onClick = { onSelectSaved(saved); onDismiss() }) { Text("${saved.displayName} (${saved.host})") }
+                    }
+                    Text(localized(language, "Atau isi profil baru di bawah.", "Or enter a new profile below."), style = MaterialTheme.typography.labelSmall)
+                }
+                OutlinedTextField(value = serverId, onValueChange = { serverId = it }, label = { Text("Server ID") }, singleLine = true)
+                OutlinedTextField(value = host, onValueChange = { host = it }, label = { Text(localized(language, "Alamat server / IP", "Server address / IP")) }, singleLine = true)
+                OutlinedTextField(value = port, onValueChange = { port = it.filter(Char::isDigit) }, label = { Text("MQTT port") }, singleLine = true)
+                OutlinedTextField(value = username, onValueChange = { username = it }, label = { Text("MQTT username") }, singleLine = true)
+                OutlinedTextField(value = password, onValueChange = { password = it }, label = { Text("MQTT password") }, singleLine = true)
+                OutlinedTextField(value = apiToken, onValueChange = { apiToken = it }, label = { Text(localized(language, "Server API token", "Server API token")) }, singleLine = true)
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { onConnect(serverId, host, port.toIntOrNull() ?: 0, username, password, apiToken) }, enabled = serverId.isNotBlank() && host.isNotBlank() && apiToken.length >= 16) {
+                Text(if (connected) localized(language, "Ubah", "Change") else localized(language, "Hubungkan", "Connect"))
+            }
+        },
+        dismissButton = {
+            Row {
+                if (connected) TextButton(onClick = onDisconnect) { Text(localized(language, "Putuskan", "Disconnect")) }
+                TextButton(onClick = onDismiss) { Text(localized(language, "Batal", "Cancel")) }
+            }
+        },
+    )
 }
 
 @Composable

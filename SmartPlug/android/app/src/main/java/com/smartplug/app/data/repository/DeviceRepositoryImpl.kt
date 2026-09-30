@@ -49,6 +49,46 @@ class DeviceRepositoryImpl @Inject constructor(
         deviceDao.updateLanIp(deviceId, lanIp)
     }
 
+    override suspend fun connectToServer(device: SmartPlugDevice, profile: com.smartplug.app.domain.model.ServerConnectionProfile): ApiResult<Unit> {
+        val lanIp = device.lanIp ?: return missingLanIpFailure()
+        val bearer = requireOwnerToken(device.deviceId) ?: return missingTokenFailure()
+        val api = apiClientFactory.deviceApi(ApiClientFactory.lanBaseUrl(lanIp))
+        val result = safeApiCall {
+            api.setMqttSettings(bearer, mapOf(
+                "mode" to "mqtt",
+                "host" to profile.brokerHost,
+                "port" to profile.brokerPort.toString(),
+                "username" to profile.mqttUsername,
+                "password" to profile.mqttPassword,
+                "topic" to profile.baseTopic,
+            ))
+        }
+        if (result is ApiResult.Success) {
+            saveDevice(device.copy(
+                integrationMode = IntegrationMode.SERVER,
+                serverId = profile.serverId,
+                serverHost = profile.brokerHost,
+                serverPort = 80,
+            ))
+        }
+        return result
+    }
+
+    override suspend fun disconnectFromServer(device: SmartPlugDevice): ApiResult<Unit> {
+        val lanIp = device.lanIp ?: return missingLanIpFailure()
+        val bearer = requireOwnerToken(device.deviceId) ?: return missingTokenFailure()
+        val api = apiClientFactory.deviceApi(ApiClientFactory.lanBaseUrl(lanIp))
+        val result = safeApiCall {
+            api.setMqttSettings(bearer, mapOf(
+                "mode" to "rest", "host" to "", "port" to "0", "username" to "", "password" to "", "topic" to "",
+            ))
+        }
+        if (result is ApiResult.Success) {
+            saveDevice(device.copy(integrationMode = IntegrationMode.DIRECT, serverId = null, serverHost = null, serverPort = 80))
+        }
+        return result
+    }
+
     override suspend fun fetchStatus(device: SmartPlugDevice): ApiResult<DeviceStatus> =
         when (device.integrationMode) {
             IntegrationMode.DIRECT -> fetchDirectStatus(device)
@@ -117,7 +157,7 @@ class DeviceRepositoryImpl @Inject constructor(
 
     private suspend fun fetchServerStatus(device: SmartPlugDevice): ApiResult<DeviceStatus> {
         val host = device.serverHost ?: return missingServerFailure()
-        val bearer = tokenStore.serverApiToken?.let { "Bearer $it" } ?: return missingTokenFailure()
+        val bearer = device.serverId?.let(tokenStore::serverApiToken)?.let { "Bearer $it" } ?: return missingTokenFailure()
         val api = apiClientFactory.serverApi(ApiClientFactory.hostBaseUrl(host, device.serverPort))
         return safeApiCall { api.getLatest(bearer, device.deviceId) }.map { dto ->
             val ageMs = (System.currentTimeMillis() - dto.capturedAtMs).coerceAtLeast(0)
@@ -142,7 +182,7 @@ class DeviceRepositoryImpl @Inject constructor(
 
     private suspend fun fetchServerMeasurement(device: SmartPlugDevice): ApiResult<ElectricalMeasurement> {
         val host = device.serverHost ?: return missingServerFailure()
-        val bearer = tokenStore.serverApiToken?.let { "Bearer $it" } ?: return missingTokenFailure()
+        val bearer = device.serverId?.let(tokenStore::serverApiToken)?.let { "Bearer $it" } ?: return missingTokenFailure()
         val api = apiClientFactory.serverApi(ApiClientFactory.hostBaseUrl(host, device.serverPort))
         return safeApiCall { api.getLatest(bearer, device.deviceId) }.map { dto ->
             val ageMs = (System.currentTimeMillis() - dto.capturedAtMs).coerceAtLeast(0)

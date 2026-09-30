@@ -7,12 +7,15 @@ import com.smartplug.app.data.local.db.HistoryDao
 import com.smartplug.app.data.local.db.HistoryPointEntity
 import com.smartplug.app.data.local.db.LoadSignatureDao
 import com.smartplug.app.data.local.db.LoadSignatureEntity
+import com.smartplug.app.data.local.ServerProfileStore
 import com.smartplug.app.domain.model.ApiFailure
 import com.smartplug.app.domain.model.DeviceStatus
 import com.smartplug.app.domain.model.ElectricalMeasurement
 import com.smartplug.app.domain.model.RelayCommandStatus
 import com.smartplug.app.domain.model.RelayState
 import com.smartplug.app.domain.model.SmartPlugDevice
+import com.smartplug.app.domain.model.ServerConnectionProfile
+import com.smartplug.app.domain.model.RegisteredServer
 import com.smartplug.app.domain.repository.DeviceRepository
 import com.smartplug.app.domain.repository.DeviceControlRepository
 import com.smartplug.app.domain.repository.RelayRepository
@@ -41,6 +44,7 @@ data class DeviceDetailUiState(
     val canSaveLoadSignature: Boolean = false,
     val detectedLoadName: String? = null,
     val vampireEnergySuspected: Boolean = false,
+    val registeredServers: List<RegisteredServer> = emptyList(),
 )
 
 data class LiveMeasurementPoint(val timestampMs: Long, val measurement: ElectricalMeasurement)
@@ -60,6 +64,7 @@ class DeviceDetailViewModel @Inject constructor(
     private val deviceControlRepository: DeviceControlRepository,
     private val historyDao: HistoryDao,
     private val loadSignatureDao: LoadSignatureDao,
+    private val serverProfileStore: ServerProfileStore,
 ) : ViewModel() {
 
     private val deviceId: String = checkNotNull(savedStateHandle["deviceId"])
@@ -71,7 +76,7 @@ class DeviceDetailViewModel @Inject constructor(
     init {
         safeLaunch {
             val device = deviceRepository.getDevice(deviceId)
-            _uiState.value = _uiState.value.copy(device = device)
+            _uiState.value = _uiState.value.copy(device = device, registeredServers = serverProfileStore.all())
         }
     }
 
@@ -271,6 +276,51 @@ class DeviceDetailViewModel @Inject constructor(
         safeLaunch {
             deviceRepository.renameDevice(deviceId, newName)
             _uiState.value = _uiState.value.copy(device = _uiState.value.device?.copy(displayName = newName))
+        }
+    }
+
+    fun connectToServer(serverId: String, host: String, port: Int, username: String, password: String, apiToken: String) {
+        val device = _uiState.value.device ?: return
+        if (serverId.isBlank() || host.isBlank() || port !in 1..65535) {
+            _uiState.value = _uiState.value.copy(lastError = "Profil ServerSmartPlug tidak valid.")
+            return
+        }
+        safeLaunch {
+            when (val result = deviceRepository.connectToServer(device, ServerConnectionProfile(
+                serverId = serverId.trim(), brokerHost = host.trim(), brokerPort = port,
+                mqttUsername = username.trim(), mqttPassword = password, baseTopic = "smartplug/${device.deviceId}",
+            ))) {
+                is ApiResult.Success -> {
+                    serverProfileStore.save(RegisteredServer(serverId.trim(), serverId.trim(), host.trim(), port, username.trim(), password), apiToken)
+                    _uiState.value = _uiState.value.copy(
+                        device = device.copy(integrationMode = com.smartplug.app.domain.model.IntegrationMode.SERVER, serverId = serverId.trim(), serverHost = host.trim()),
+                        registeredServers = serverProfileStore.all(), lastError = null,
+                    )
+                }
+                is ApiResult.Failure -> _uiState.value = _uiState.value.copy(lastError = describeError(result.error))
+            }
+        }
+    }
+
+    fun connectSavedServer(server: RegisteredServer) {
+        val token = serverProfileStore.apiToken(server.serverId)
+        if (token.isNullOrBlank()) {
+            _uiState.value = _uiState.value.copy(lastError = "Token API server tidak tersedia. Simpan ulang profil server.")
+            return
+        }
+        connectToServer(server.serverId, server.host, server.mqttPort, server.mqttUsername, server.mqttPassword, token)
+    }
+
+    fun disconnectFromServer() {
+        val device = _uiState.value.device ?: return
+        safeLaunch {
+            when (val result = deviceRepository.disconnectFromServer(device)) {
+                is ApiResult.Success -> _uiState.value = _uiState.value.copy(
+                    device = device.copy(integrationMode = com.smartplug.app.domain.model.IntegrationMode.DIRECT, serverId = null, serverHost = null),
+                    lastError = null,
+                )
+                is ApiResult.Failure -> _uiState.value = _uiState.value.copy(lastError = describeError(result.error))
+            }
         }
     }
 

@@ -26,13 +26,25 @@ android {
             applicationIdSuffix = ".debug"
         }
         release {
-            isMinifyEnabled = true
-            isShrinkResources = true
+            // This locally signed handoff is intentionally not minified: the bundled Tink
+            // dependency has unresolved optional Error Prone annotations under R8. Keeping the
+            // bytecode intact avoids an installer artifact that differs from the verified debug
+            // build while a dedicated production signing/release pipeline is not configured.
+            isMinifyEnabled = false
+            isShrinkResources = false
+            // This project has no private release keystore in the workspace.  Sign the
+            // installable handoff artifact with the local debug key rather than emitting an
+            // unsigned release APK; this enables the broad v1/v2/v3 installer compatibility.
+            signingConfig = signingConfigs.getByName("debug")
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-            // No release keystore was provided for this build; the release build type
-            // is left unsigned so `assembleDebug` (the deliverable for this task) is
-            // unaffected. Supply signingConfigs.release and reference it here to
-            // produce a signed release APK.
+        }
+    }
+
+    signingConfigs {
+        getByName("debug") {
+            enableV1Signing = true
+            enableV2Signing = true
+            enableV3Signing = true
         }
     }
 

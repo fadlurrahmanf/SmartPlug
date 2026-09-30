@@ -37,6 +37,9 @@ open class ApiClientFactory @Inject constructor(
     fun serverApi(baseUrl: String): ServerApi =
         retrofitFor(baseUrl).create(ServerApi::class.java)
 
+    fun serverSetupApi(baseUrl: String = PAIRING_BASE_URL): ServerSetupApi =
+        retrofitFor(baseUrl).create(ServerSetupApi::class.java)
+
     private fun retrofitFor(baseUrl: String): Retrofit {
         val normalized = if (baseUrl.endsWith("/")) baseUrl else "$baseUrl/"
         return retrofitCache.getOrPut(normalized) {

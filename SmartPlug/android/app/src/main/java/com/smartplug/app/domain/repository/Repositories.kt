@@ -72,6 +72,10 @@ interface DeviceRepository {
     suspend fun removeDevice(deviceId: String)
     suspend fun renameDevice(deviceId: String, displayName: String)
     suspend fun updateLanIp(deviceId: String, lanIp: String)
+    /** Applies the MQTT profile to the already paired unit, then persists its selected route. */
+    suspend fun connectToServer(device: SmartPlugDevice, profile: ServerConnectionProfile): ApiResult<Unit>
+    /** Restores direct REST as the app route and clears the device's MQTT profile. */
+    suspend fun disconnectFromServer(device: SmartPlugDevice): ApiResult<Unit>
 
     suspend fun fetchStatus(device: SmartPlugDevice): ApiResult<DeviceStatus>
     suspend fun fetchMeasurement(device: SmartPlugDevice): ApiResult<ElectricalMeasurement>

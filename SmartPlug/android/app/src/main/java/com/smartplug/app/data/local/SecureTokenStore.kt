@@ -49,6 +49,18 @@ class SecureTokenStore @Inject constructor(
             prefs.edit().putString(KEY_SERVER_API_TOKEN, value).apply()
         }
 
+    fun serverApiToken(serverId: String): String? = prefs.getString(serverTokenKey(serverId), null)
+
+    fun setServerApiToken(serverId: String, token: String) {
+        prefs.edit().putString(serverTokenKey(serverId), token).apply()
+    }
+
+    fun serverProfilesJson(): String = prefs.getString(KEY_SERVER_PROFILES, "[]") ?: "[]"
+
+    fun setServerProfilesJson(value: String) {
+        prefs.edit().putString(KEY_SERVER_PROFILES, value).apply()
+    }
+
     fun savedWifiPassword(ssid: String): String? = prefs.getString(wifiKey(ssid), null)
 
     fun saveWifiPassword(ssid: String, password: String) {
@@ -62,8 +74,10 @@ class SecureTokenStore @Inject constructor(
 
     private fun ownerTokenKey(deviceId: String) = "owner_token_$deviceId"
     private fun wifiKey(ssid: String) = "wifi_pw_$ssid"
+    private fun serverTokenKey(serverId: String) = "server_api_token_$serverId"
 
     companion object {
         private const val KEY_SERVER_API_TOKEN = "server_api_token"
+        private const val KEY_SERVER_PROFILES = "server_profiles"
     }
 }

@@ -10,6 +10,7 @@ import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import com.smartplug.app.ui.components.AppScaffold
 import com.smartplug.app.ui.screens.addplug.AddSmartPlugScreen
+import com.smartplug.app.ui.screens.addserver.AddServerScreen
 import com.smartplug.app.ui.screens.devicedetail.DeviceDetailScreen
 import com.smartplug.app.ui.screens.devices.DeviceListScreen
 import com.smartplug.app.ui.screens.history.EnergyHistoryScreen
@@ -62,6 +63,7 @@ fun SmartPlugNavHost(
                         navController.navigate(Routes.DeviceDetail.createRoute(deviceId))
                     },
                     onAddSmartPlug = { navController.navigate(Routes.AddSmartPlug.route) },
+                    onAddServer = { navController.navigate(Routes.AddServer.route) },
                 )
             }
             composable(Routes.AddSmartPlug.route) {
@@ -73,6 +75,9 @@ fun SmartPlugNavHost(
                     },
                     onCancel = { navController.popBackStack() },
                 )
+            }
+            composable(Routes.AddServer.route) {
+                AddServerScreen(onDone = { navController.popBackStack() }, onBack = { navController.popBackStack() })
             }
             composable(Routes.Settings.route) {
                 SettingsScreen()

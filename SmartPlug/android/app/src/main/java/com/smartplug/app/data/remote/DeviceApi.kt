@@ -36,6 +36,13 @@ interface DeviceApi {
     ): Response<RelayCommandResponseDto>
 
     @FormUrlEncoded
+    @POST("/api/v1/settings/mqtt")
+    suspend fun setMqttSettings(
+        @Header("Authorization") bearerToken: String,
+        @FieldMap values: Map<String, String>,
+    ): Response<Unit>
+
+    @FormUrlEncoded
     @POST("/api/v1/energy/reset")
     suspend fun resetEnergy(
         @Header("Authorization") bearerToken: String,

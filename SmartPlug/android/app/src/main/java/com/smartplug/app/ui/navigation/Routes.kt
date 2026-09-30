@@ -10,6 +10,7 @@ sealed class Routes(val route: String) {
     data object Home : Routes("home")
     data object Devices : Routes("devices")
     data object AddSmartPlug : Routes("add_smartplug")
+    data object AddServer : Routes("add_server")
     data object Settings : Routes("settings")
 
     data object DeviceDetail : Routes("device/{deviceId}") {

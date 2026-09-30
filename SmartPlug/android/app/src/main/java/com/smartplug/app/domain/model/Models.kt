@@ -51,6 +51,16 @@ data class DiscoveredServer(
     val port: Int,
 )
 
+/** A ServerSmartPlug registered in this app.  Its secret API token stays only in encrypted storage. */
+data class RegisteredServer(
+    val serverId: String,
+    val displayName: String,
+    val host: String,
+    val mqttPort: Int = 1883,
+    val mqttUsername: String = "SmartPlug",
+    val mqttPassword: String = "deviotsolution",
+)
+
 /** A Wi-Fi network reported by SmartPlug's own `/api/v1/pair/scan-wifi`. */
 data class HomeWifiNetwork(
     val ssid: String,

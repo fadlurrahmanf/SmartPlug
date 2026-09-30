@@ -178,6 +178,7 @@ class WifiOnboardingRepositoryImpl @Inject constructor(
             }
         }
 
+
     override fun releaseApBinding() {
         connectivityManager.bindProcessToNetwork(null)
         boundCallback?.let { runCatching { connectivityManager.unregisterNetworkCallback(it) } }

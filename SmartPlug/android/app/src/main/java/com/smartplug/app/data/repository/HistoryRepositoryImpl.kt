@@ -40,7 +40,7 @@ class HistoryRepositoryImpl @Inject constructor(
         }
         val host = device.serverHost
             ?: return cachedOrFailure(device, fromUtcMs, toUtcMs, resolution, ApiFailure(0, "missing_server_host"))
-        val bearer = tokenStore.serverApiToken?.let { "Bearer $it" }
+        val bearer = device.serverId?.let(tokenStore::serverApiToken)?.let { "Bearer $it" }
             ?: return cachedOrFailure(device, fromUtcMs, toUtcMs, resolution, ApiFailure(0, "missing_server_token"))
 
         val api = apiClientFactory.serverApi(ApiClientFactory.hostBaseUrl(host, device.serverPort))

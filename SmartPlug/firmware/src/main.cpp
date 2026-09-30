@@ -8,6 +8,7 @@
 // headers directly and excludes this file), so no host-side Arduino polyfill
 // is needed here.
 #include <Arduino.h>
+#include <ESP8266mDNS.h>
 #include <LittleFS.h>
 #include <math.h>
 #include <time.h>
@@ -195,6 +196,7 @@ class SmartPlugApi {
 
  private:
   void startNetwork();
+  void serviceMdns();
   void handleDashboard();
   void handleRawStatsScript();
   void handleDashboardVersionScript();
@@ -250,6 +252,7 @@ class SmartPlugApi {
 
   ESP8266WebServer server_;
   bool webServerStarted_ = false;
+  bool mdnsStarted_ = false;
   String relayCommandResult_ = "none";
   bool stationConfigured_ = false;
   String configuredStationSsid_;
@@ -1887,7 +1890,23 @@ void SmartPlugApi::begin() {
   webServerStarted_ = true;
 }
 
-void SmartPlugApi::handleClient() { server_.handleClient(); }
+void SmartPlugApi::serviceMdns() {
+  if (WiFi.status() != WL_CONNECTED || mdnsStarted_) return;
+  String host = String("smartplug-") + deviceId();
+  host.toLowerCase();
+  if (!MDNS.begin(host.c_str())) {
+    Serial.println(F("WARN mdns_start_failed"));
+    return;
+  }
+  MDNS.addService("smartplug", "tcp", 80);
+  MDNS.addServiceTxt("smartplug", "tcp", "device_id", deviceId());
+  MDNS.addServiceTxt("smartplug", "tcp", "api_version", "v1");
+  mdnsStarted_ = true;
+  Serial.print(F("INFO mdns_ready host="));
+  Serial.print(host);
+  Serial.println(F(".local"));
+}
+void SmartPlugApi::handleClient() { serviceMdns(); MDNS.update(); server_.handleClient(); }
 void SmartPlugApi::printWebDiagnostics() {
   Serial.print(F("{\"web_server_started\":"));
   Serial.print(webServerStarted_ ? F("true") : F("false"));
@@ -2170,7 +2189,13 @@ void SmartPlugApi::handleSession() {
   sendJson(200, String("{\"authenticated\":true,\"csrf_token\":\"") + csrfToken_ + "\",\"expires_in_s\":900}");
 }
 void SmartPlugApi::handleWifiSettings() {
-  if (!requireSession(true) || !validateMutationRate(kMutationMinimumMs)) return;
+  // The Android app owns the per-device owner token obtained at pairing time.  Allow that
+  // credential to move an already-paired unit between direct REST and ServerSmartPlug MQTT
+  // without requiring the browser-only admin session/CSRF cookie.  The owner token is never
+  // accepted for the broader access-point/admin settings endpoints.
+  const bool viaOwnerToken = requireOwnerTokenBearer();
+  if (!viaOwnerToken && !requireSession(true)) return;
+  if (!validateMutationRate(kMutationMinimumMs)) return;
   const String ssid = server_.arg("ssid");
   const String password = server_.arg("password");
   if (!validateText(ssid, 1, 32, true) ||
