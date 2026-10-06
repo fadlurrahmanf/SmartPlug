@@ -1,6 +1,5 @@
 package com.smartplug.app.ui.screens.addplug
 
-import com.smartplug.app.domain.model.DiscoveredServer
 import com.smartplug.app.domain.model.DiscoveredSmartPlugAp
 import com.smartplug.app.domain.model.HomeWifiNetwork
 
@@ -27,8 +26,6 @@ data class AddSmartPlugUiState(
     val selectedSsid: String? = null,
     val homeWifiPassword: String = "",
     val homeWifiPasswordVisible: Boolean = false,
-    val discoveredServer: DiscoveredServer? = null,
-    val useServer: Boolean = false,
     val configurationId: String? = null,
     val resultDisplayName: String = "",
     val resultDeviceId: String? = null,

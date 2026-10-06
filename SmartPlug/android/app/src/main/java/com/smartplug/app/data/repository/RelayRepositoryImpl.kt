@@ -37,7 +37,11 @@ class RelayRepositoryImpl @Inject constructor(
         targetState: RelayState,
     ): ApiResult<RelayCommandResult> = when (device.integrationMode) {
         IntegrationMode.DIRECT -> awaitDirectSettled(device, commandId, targetState)
-        IntegrationMode.SERVER -> awaitServerSettled(device, commandId)
+        // A member learns Server mode from the safe profile but never receives another
+        // phone's ServerSmartPlug API token.  Such a member can still operate the local
+        // SmartPlug using its own device-scoped credential, including settle polling.
+        IntegrationMode.SERVER -> if (hasServerToken(device)) awaitServerSettled(device, commandId)
+        else awaitDirectSettled(device, commandId, targetState)
     }
 
     private suspend fun setRelayDirect(device: SmartPlugDevice, targetState: String): ApiResult<RelayCommandResult> {
@@ -55,6 +59,7 @@ class RelayRepositoryImpl @Inject constructor(
     }
 
     private suspend fun setRelayServer(device: SmartPlugDevice, targetState: String): ApiResult<RelayCommandResult> {
+        if (!hasServerToken(device)) return setRelayDirect(device, targetState)
         val host = device.serverHost ?: return ApiResult.Failure(ApiFailure(0, "missing_server_host"))
         val bearer = device.serverId?.let(tokenStore::serverApiToken)?.let { "Bearer $it" }
             ?: return ApiResult.Failure(ApiFailure(0, "missing_server_token"))
@@ -87,8 +92,15 @@ class RelayRepositoryImpl @Inject constructor(
         var elapsedMs = 0L
         while (elapsedMs < DIRECT_SETTLE_TIMEOUT_MS) {
             val result = safeApiCall { api.getStatus(bearer) }
-            if (result is ApiResult.Success && DeviceRepositoryImpl.parseRelayState(result.value.relayState) == targetState) {
-                return ApiResult.Success(RelayCommandResult(commandId, RelayCommandStatus.COMPLETED, targetState))
+            if (result is ApiResult.Success) {
+                if (result.value.relayCommandResult == "zero_cross_timeout") {
+                    return ApiResult.Success(
+                        RelayCommandResult(commandId, RelayCommandStatus.REJECTED, RelayState.UNKNOWN),
+                    )
+                }
+                if (DeviceRepositoryImpl.parseRelayState(result.value.relayState) == targetState) {
+                    return ApiResult.Success(RelayCommandResult(commandId, RelayCommandStatus.COMPLETED, targetState))
+                }
             }
             delay(SETTLE_POLL_INTERVAL_MS)
             elapsedMs += SETTLE_POLL_INTERVAL_MS
@@ -125,6 +137,9 @@ class RelayRepositoryImpl @Inject constructor(
         }
         return ApiResult.Success(RelayCommandResult(commandId, RelayCommandStatus.TIMEOUT, RelayState.UNKNOWN))
     }
+
+    private fun hasServerToken(device: SmartPlugDevice): Boolean =
+        device.serverId?.let(tokenStore::serverApiToken) != null
 
     companion object {
         private const val SETTLE_POLL_INTERVAL_MS = 500L

@@ -9,11 +9,14 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
+import com.smartplug.app.ui.components.popIn
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material.icons.filled.Wifi
@@ -25,12 +28,12 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
-import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.runtime.Composable
+import com.smartplug.app.ui.components.StepperHeader
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -42,6 +45,7 @@ import com.smartplug.app.domain.model.DiscoveredSmartPlugAp
 import com.smartplug.app.domain.model.HomeWifiNetwork
 import com.smartplug.app.domain.model.rssiToSignalPercent
 import com.smartplug.app.ui.components.FullScreenLoading
+import com.smartplug.app.ui.components.OrbitLoadingIndicator
 import com.smartplug.app.ui.components.SmartPlugCard
 import com.smartplug.app.ui.theme.AccentGreen
 import com.smartplug.app.ui.localization.LocalAppLanguage
@@ -68,6 +72,13 @@ fun AddSmartPlugScreen(
                 navigationIcon = {
                     IconButton(onClick = onCancel) { Icon(Icons.Filled.ArrowBack, contentDescription = localized(language, "Batal", "Cancel")) }
                 },
+                actions = {
+                    if (uiState.step == OnboardingStep.CHOOSING_HOME_WIFI) {
+                        IconButton(onClick = viewModel::refreshHomeWifi) {
+                            Icon(Icons.Filled.Refresh, contentDescription = localized(language, "Muat ulang Wi-Fi", "Refresh Wi-Fi"))
+                        }
+                    }
+                },
             )
         },
     ) { padding ->
@@ -90,6 +101,8 @@ fun AddSmartPlugScreen(
                 )
                 return@Scaffold
             }
+
+            StepperHeader(current = pairingStage(uiState.step), modifier = Modifier.padding(bottom = 16.dp))
 
             when (uiState.step) {
                 OnboardingStep.SCANNING_DEVICES -> ScanningDevicesContent(
@@ -159,7 +172,7 @@ private fun StepProgress(message: String) {
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center,
     ) {
-        CircularProgressIndicator()
+        OrbitLoadingIndicator()
         Text(message, modifier = Modifier.padding(top = 16.dp), style = MaterialTheme.typography.bodyLarge)
     }
 }
@@ -183,7 +196,7 @@ private fun ScanningDevicesContent(
         if (aps.isEmpty()) {
             Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth().padding(top = 32.dp)) {
                 if (isScanning) {
-                    CircularProgressIndicator()
+                    OrbitLoadingIndicator(modifier = Modifier.size(28.dp))
                     Text(localized(language, "Mencari SmartPlug...", "Searching for SmartPlug..."), modifier = Modifier.padding(top = 12.dp))
                 } else {
                     Icon(Icons.Filled.Wifi, contentDescription = null)
@@ -242,7 +255,9 @@ private fun ChoosingHomeWifiContent(uiState: AddSmartPlugUiState, viewModel: Add
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.padding(top = 4.dp, bottom = 16.dp),
         )
-        LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.weight(1f, fill = false)) {
+        // Give the list all remaining height: long scan results stay scrollable instead of
+        // looking as though only the first handful of SSIDs exist.
+        LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.weight(1f)) {
             // No caller-supplied key here: a malformed/older firmware response
             // must never turn repeated SSIDs into a Compose runtime crash.
             items(uiState.homeWifiNetworks) { network ->
@@ -275,17 +290,6 @@ private fun ChoosingHomeWifiContent(uiState: AddSmartPlugUiState, viewModel: Add
                 },
                 modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
             )
-
-            if (uiState.discoveredServer != null) {
-                Row(
-                    modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text(localized(language, "Gunakan ServerSmartPlug", "Use ServerSmartPlug"), style = MaterialTheme.typography.bodyLarge)
-                    Switch(checked = uiState.useServer, onCheckedChange = viewModel::setUseServer)
-                }
-            }
 
             Button(
                 onClick = viewModel::confirmAndConnect,
@@ -325,7 +329,7 @@ private fun SuccessContent(uiState: AddSmartPlugUiState, viewModel: AddSmartPlug
             Icons.Filled.CheckCircle,
             contentDescription = null,
             tint = AccentGreen,
-            modifier = Modifier.padding(top = 32.dp),
+            modifier = Modifier.padding(top = 32.dp).size(72.dp).popIn(),
         )
         Text(localized(language, "SmartPlug siap digunakan", "SmartPlug is ready"), style = MaterialTheme.typography.titleLarge, modifier = Modifier.padding(top = 12.dp))
         OutlinedTextField(
@@ -359,4 +363,11 @@ private fun FailedContent(message: String?, onRetry: () -> Unit, onCancel: () ->
             Button(onClick = onCancel) { Text(localized(language, "Batal", "Cancel")) }
         }
     }
+}
+
+private fun pairingStage(step: OnboardingStep): Int = when (step) {
+    OnboardingStep.SCANNING_DEVICES -> 1
+    OnboardingStep.CONNECTING_TO_DEVICE, OnboardingStep.SCANNING_HOME_WIFI, OnboardingStep.CHOOSING_HOME_WIFI -> 2
+    OnboardingStep.CONFIGURING, OnboardingStep.WAITING_FOR_CONNECTION, OnboardingStep.VERIFYING, OnboardingStep.FAILED -> 3
+    OnboardingStep.SUCCESS -> 4
 }

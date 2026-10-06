@@ -10,7 +10,6 @@ import com.smartplug.app.domain.model.PairInfo
 import com.smartplug.app.domain.model.PairingFailureReason
 import com.smartplug.app.domain.model.PairingState
 import com.smartplug.app.domain.model.PairingStatus
-import com.smartplug.app.domain.model.ServerConnectionProfile
 import com.smartplug.app.domain.repository.PairingRepository
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
@@ -40,7 +39,7 @@ class PairingRepositoryImpl @Inject constructor(
         }
 
     override suspend fun scanHomeWifi(pairingToken: String): ApiResult<List<HomeWifiNetwork>> =
-        safeApiCall { api.scanWifi(pairingToken) }.map { dto ->
+        safeApiCall { apiClientFactory.pairingScanApi().scanWifi(pairingToken) }.map { dto ->
             dto.networks.map { HomeWifiNetwork(it.ssid, it.rssi, it.security) }
         }
 
@@ -57,41 +56,9 @@ class PairingRepositoryImpl @Inject constructor(
         return safeApiCall { api.configure(pairingToken, request) }.map { it.configurationId }
     }
 
-    override suspend fun configureWithServer(
-        pairingToken: String,
-        ssid: String,
-        password: String,
-        serverProfile: ServerConnectionProfile,
-    ): ApiResult<String> {
-        val request = PairConfigureRequestDto(
-            ssid = ssid,
-            password = password,
-            connectionProfile = mapOf(
-                "type" to "server",
-                "server_id" to serverProfile.serverId,
-                "broker_host" to serverProfile.brokerHost,
-                "broker_port" to serverProfile.brokerPort,
-                "mqtt_username" to serverProfile.mqttUsername,
-                "mqtt_password" to serverProfile.mqttPassword,
-                "base_topic" to serverProfile.baseTopic,
-            ),
-        )
-        return safeApiCall { api.configure(pairingToken, request) }.map { it.configurationId }
-    }
-
     override fun pollStatus(pairingToken: String, configurationId: String): Flow<ApiResult<PairingStatus>> = flow {
         while (true) {
-            val mapped = safeApiCall { api.getStatus(pairingToken, configurationId) }.map { dto ->
-                PairingStatus(
-                    state = parseState(dto.state),
-                    deviceId = dto.deviceId,
-                    staMac = dto.staMac,
-                    lanIp = dto.lanIp,
-                    ownerToken = dto.ownerToken,
-                    ssid = dto.ssid,
-                    failureReason = dto.reason?.let(PairingFailureReason::from),
-                )
-            }
+            val mapped = fetchStatus(api, pairingToken, configurationId)
             emit(mapped)
 
             val terminal = when (mapped) {
@@ -105,6 +72,30 @@ class PairingRepositoryImpl @Inject constructor(
             delay(1_000)
         }
     }
+
+    override suspend fun fetchStatusAt(
+        baseUrl: String,
+        pairingToken: String,
+        configurationId: String,
+    ): ApiResult<PairingStatus> =
+        fetchStatus(apiClientFactory.pairingApi(baseUrl), pairingToken, configurationId)
+
+    private suspend fun fetchStatus(
+        targetApi: com.smartplug.app.data.remote.PairingApi,
+        pairingToken: String,
+        configurationId: String,
+    ): ApiResult<PairingStatus> =
+        safeApiCall { targetApi.getStatus(pairingToken, configurationId) }.map { dto ->
+            PairingStatus(
+                state = parseState(dto.state),
+                deviceId = dto.deviceId,
+                staMac = dto.staMac,
+                lanIp = dto.lanIp,
+                ownerToken = dto.ownerToken,
+                ssid = dto.ssid,
+                failureReason = dto.reason?.let(PairingFailureReason::from),
+            )
+        }
 
     private fun parseState(wireState: String): PairingState = when (wireState) {
         "unprovisioned" -> PairingState.UNPROVISIONED

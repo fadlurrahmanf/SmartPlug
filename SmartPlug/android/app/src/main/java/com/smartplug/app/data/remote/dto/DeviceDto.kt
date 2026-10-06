@@ -23,6 +23,7 @@ data class DeviceStatusDto(
     @Json(name = "device_id") val deviceId: String,
     @Json(name = "relay_state") val relayState: String,
     @Json(name = "relay_actuation") val relayActuationEnabled: Boolean = true,
+    @Json(name = "relay_command_result") val relayCommandResult: String? = null,
     @Json(name = "wifi_connected") val wifiConnected: Boolean = true,
     @Json(name = "has_sample") val hasSample: Boolean = false,
     @Json(name = "fresh") val fresh: Boolean = false,
@@ -107,4 +108,58 @@ data class RelayCommandResponseDto(
     @Json(name = "command_id") val commandId: String,
     @Json(name = "state") val state: String,
     @Json(name = "status") val status: String,
+)
+
+/** Safe, credential-authorized state returned when an existing SmartPlug is added on another phone.
+ * This deliberately contains no Wi-Fi password, MQTT password, or owner credential. */
+@JsonClass(generateAdapter = true)
+data class DeviceAccessProfileDto(
+    @Json(name = "api_version") val apiVersion: String,
+    @Json(name = "device_id") val deviceId: String,
+    @Json(name = "integration_mode") val integrationMode: String,
+    @Json(name = "server_host") val serverHost: String? = null,
+    @Json(name = "server_port") val serverPort: Int? = null,
+    @Json(name = "display_name") val displayName: String? = null,
+    @Json(name = "relay_state") val relayState: String,
+    @Json(name = "timer") val timer: DeviceTimerDto? = null,
+    @Json(name = "schedule") val schedule: DeviceScheduleDto? = null,
+)
+
+@JsonClass(generateAdapter = true)
+data class AccessInvitationRequestDto(
+    @Json(name = "role") val role: String = "member",
+)
+
+@JsonClass(generateAdapter = true)
+data class AccessInvitationResponseDto(
+    @Json(name = "api_version") val apiVersion: String,
+    @Json(name = "invite_code") val inviteCode: String,
+    @Json(name = "expires_in_s") val expiresInSeconds: Long,
+)
+
+/** Deliberately contains an identifier and role only: it is safe to show to the owner. */
+@JsonClass(generateAdapter = true)
+data class AccessCredentialDto(
+    @Json(name = "credential_id") val credentialId: String,
+    @Json(name = "role") val role: String,
+)
+
+@JsonClass(generateAdapter = true)
+data class AccessCredentialsResponseDto(
+    @Json(name = "credentials") val credentials: List<AccessCredentialDto> = emptyList(),
+)
+
+@JsonClass(generateAdapter = true)
+data class AccessEnrollRequestDto(
+    @Json(name = "device_id") val deviceId: String,
+    @Json(name = "invite_code") val inviteCode: String,
+)
+
+@JsonClass(generateAdapter = true)
+data class AccessEnrollResponseDto(
+    @Json(name = "api_version") val apiVersion: String,
+    @Json(name = "credential") val credential: String,
+    @Json(name = "credential_id") val credentialId: String,
+    @Json(name = "role") val role: String,
+    @Json(name = "profile") val profile: DeviceAccessProfileDto,
 )

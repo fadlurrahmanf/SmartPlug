@@ -35,6 +35,9 @@ enum class PollingCadence(val intervalMs: Long) {
     /** design.md: layar live/QC terbuka. */
     LIVE(1_000),
 
+    /** ServerSmartPlug already holds a fresh MQTT snapshot every 500 ms. */
+    SERVER_MONITORING(500),
+
     /** design.md: daftar perangkat tetap terlihat. */
     DEVICE_LIST(5_000),
 }

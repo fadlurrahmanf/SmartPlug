@@ -38,6 +38,20 @@ class ServerProfileStore @Inject constructor(
         tokenStore.setServerApiToken(server.serverId, apiToken)
     }
 
+    /** Removes only this phone's saved server profile and its local API token. */
+    fun remove(serverId: String) {
+        val serialized = JSONArray().also { array ->
+            all().filterNot { it.serverId == serverId }.forEach { profile ->
+                array.put(JSONObject().apply {
+                    put("id", profile.serverId); put("name", profile.displayName); put("host", profile.host)
+                    put("mqttPort", profile.mqttPort); put("mqttUsername", profile.mqttUsername); put("mqttPassword", profile.mqttPassword)
+                })
+            }
+        }
+        tokenStore.setServerProfilesJson(serialized.toString())
+        tokenStore.clearServerApiToken(serverId)
+    }
+
     fun apiToken(serverId: String): String? = tokenStore.serverApiToken(serverId)
 
 }

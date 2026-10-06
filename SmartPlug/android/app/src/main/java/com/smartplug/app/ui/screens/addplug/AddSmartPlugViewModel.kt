@@ -3,12 +3,12 @@ package com.smartplug.app.ui.screens.addplug
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.smartplug.app.data.local.SecureTokenStore
+import com.smartplug.app.data.remote.ApiClientFactory
 import com.smartplug.app.data.remote.ApiResult
 import com.smartplug.app.domain.model.DiscoveredSmartPlugAp
 import com.smartplug.app.domain.model.IntegrationMode
 import com.smartplug.app.domain.model.PairingFailureReason
 import com.smartplug.app.domain.model.PairingState
-import com.smartplug.app.domain.model.ServerConnectionProfile
 import com.smartplug.app.domain.model.SmartPlugDevice
 import com.smartplug.app.domain.repository.DeviceRepository
 import com.smartplug.app.domain.repository.DiscoveryRepository
@@ -20,24 +20,23 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collect
-import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.takeWhile
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import javax.inject.Inject
 
-/** design.md "Profil MQTT server selalu menggunakan username SmartPlug dan password
- * deviotsolution" — fixed system credentials, not something the user enters. */
-private const val SERVER_MQTT_USERNAME = "SmartPlug"
-private const val SERVER_MQTT_PASSWORD = "deviotsolution"
-private const val SERVER_DISCOVERY_TIMEOUT_MS = 4_000L
 private const val HOME_WIFI_RESTORE_TIMEOUT_MS = 20_000L
+private const val LAN_PAIRING_ATTEMPTS = 8
+private const val LAN_DISCOVERY_ATTEMPT_TIMEOUT_MS = 3_000L
+private const val LAN_PAIRING_RETRY_DELAY_MS = 1_000L
 
 @HiltViewModel
 class AddSmartPlugViewModel @Inject constructor(
     private val wifiOnboardingRepository: WifiOnboardingRepository,
     private val pairingRepository: PairingRepository,
-    private val discoveryRepository: DiscoveryRepository,
     private val deviceRepository: DeviceRepository,
     private val tokenStore: SecureTokenStore,
+    private val discoveryRepository: DiscoveryRepository,
 ) : ViewModel() {
 
     private val _uiState = MutableStateFlow(AddSmartPlugUiState())
@@ -82,11 +81,10 @@ class AddSmartPlugViewModel @Inject constructor(
         launchSafely {
             wifiOnboardingRepository.scanForSmartPlugAps()
                 .onSuccess { aps ->
-                    val registeredApUnitIds = deviceRepository.observeDevices().first()
-                        .mapNotNull { it.apUnitId }
-                        .toSet()
-                    val unregisteredAps = aps.filterNot { it.unitId in registeredApUnitIds }
-                    _uiState.value = _uiState.value.copy(discoveredAps = unregisteredAps, isScanningDevices = false)
+                    // A factory-reset SmartPlug keeps its AP/unit ID, while the old profile can
+                    // still be in Room.  Do not hide that AP: the normal pairing flow will
+                    // upsert the refreshed profile and credentials after it reconnects.
+                    _uiState.value = _uiState.value.copy(discoveredAps = aps, isScanningDevices = false)
                 }
                 .onFailure { e ->
                     _uiState.value = _uiState.value.copy(
@@ -140,12 +138,9 @@ class AddSmartPlugViewModel @Inject constructor(
         launchSafely {
             when (val result = pairingRepository.scanHomeWifi(token)) {
                 is ApiResult.Success -> _uiState.value = _uiState.value.copy(
-                    // One SSID can be announced by several APs in a mesh/repeater.
-                    // Keeping all of them used to feed duplicate LazyColumn keys and
-                    // crash exactly when the home Wi-Fi chooser was composed.
                     homeWifiNetworks = result.value
                         .groupBy { it.ssid }
-                        .map { (_, networks) -> networks.maxBy { it.rssi } }
+                        .map { (_, sameSsid) -> sameSsid.maxBy { it.rssi } }
                         .sortedByDescending { it.rssi },
                     step = OnboardingStep.CHOOSING_HOME_WIFI,
                 )
@@ -155,11 +150,6 @@ class AddSmartPlugViewModel @Inject constructor(
                 )
             }
         }
-        // ServerSmartPlug discovery (NSD/mDNS) is disabled for now: on at least one real device
-        // it caused a crash that survived every JVM-level exception guard above, which points to
-        // a platform/NSD-stack-level failure (e.g. native), not something try/catch can stop.
-        // Nobody in this flow has a ServerSmartPlug anyway; direct REST mode never needed this
-        // call. Re-enable only after that's root-caused on a device that can reproduce it.
     }
 
     fun selectSsid(ssid: String) {
@@ -167,12 +157,17 @@ class AddSmartPlugViewModel @Inject constructor(
         _uiState.value = _uiState.value.copy(selectedSsid = ssid, homeWifiPassword = savedPassword)
     }
 
-    fun setHomeWifiPassword(password: String) {
-        _uiState.value = _uiState.value.copy(homeWifiPassword = password)
+    fun refreshHomeWifi() {
+        if (_uiState.value.pairingToken == null) return
+        _uiState.value = _uiState.value.copy(
+            step = OnboardingStep.SCANNING_HOME_WIFI,
+            errorMessage = null,
+        )
+        scanHomeWifi()
     }
 
-    fun setUseServer(enabled: Boolean) {
-        _uiState.value = _uiState.value.copy(useServer = enabled)
+    fun setHomeWifiPassword(password: String) {
+        _uiState.value = _uiState.value.copy(homeWifiPassword = password)
     }
 
     fun toggleHomeWifiPasswordVisible() {
@@ -183,7 +178,7 @@ class AddSmartPlugViewModel @Inject constructor(
         val state = _uiState.value
         val token = state.pairingToken ?: return
         val ssid = state.selectedSsid ?: return
-        val deviceId = state.expectedDeviceId ?: return
+        if (state.expectedDeviceId == null) return
         val password = state.homeWifiPassword
 
         // Clear the on-screen field the instant "Hubungkan" is tapped, not after the request
@@ -195,23 +190,9 @@ class AddSmartPlugViewModel @Inject constructor(
             homeWifiPasswordVisible = false,
         )
         launchSafely {
-            val configureResult = if (state.useServer && state.discoveredServer != null) {
-                pairingRepository.configureWithServer(
-                    pairingToken = token,
-                    ssid = ssid,
-                    password = password,
-                    serverProfile = ServerConnectionProfile(
-                        serverId = state.discoveredServer.serverId,
-                        brokerHost = state.discoveredServer.host,
-                        brokerPort = state.discoveredServer.port,
-                        mqttUsername = SERVER_MQTT_USERNAME,
-                        mqttPassword = SERVER_MQTT_PASSWORD,
-                        baseTopic = "smartplug/$deviceId",
-                    ),
-                )
-            } else {
-                pairingRepository.configureDirect(token, ssid, password)
-            }
+            // Direct onboarding is intentionally isolated from ServerSmartPlug.
+            // A server can only be selected later from this SmartPlug's detail menu.
+            val configureResult = pairingRepository.configureDirect(token, ssid, password)
 
             when (configureResult) {
                 is ApiResult.Success -> {
@@ -232,28 +213,108 @@ class AddSmartPlugViewModel @Inject constructor(
 
     private fun watchPairingStatus(token: String, configurationId: String) {
         launchSafely {
-            pairingRepository.pollStatus(token, configurationId).collect { result ->
+            // A failed request to the setup AP is expected when the ESP8266 changes channel to
+            // join the home Wi-Fi.  The original AP poll must stop after either a terminal AP
+            // response or the single AP-to-LAN recovery attempt; otherwise it keeps retrying a
+            // setup network that was deliberately released and can create background traffic.
+            pairingRepository.pollStatus(token, configurationId).takeWhile { result ->
                 when (result) {
                     is ApiResult.Success -> when (result.value.state) {
-                        PairingState.CONNECTED -> finalizeOnboarding(
-                            deviceId = result.value.deviceId ?: _uiState.value.expectedDeviceId.orEmpty(),
-                            staMac = result.value.staMac.orEmpty(),
-                            lanIp = result.value.lanIp,
-                            ownerToken = result.value.ownerToken,
-                        )
-                        PairingState.FAILED -> _uiState.value = _uiState.value.copy(
-                            step = OnboardingStep.FAILED,
-                            errorMessage = describeFailure(result.value.failureReason),
-                        )
-                        else -> Unit // CONNECTING/PAIRING/UNPROVISIONED: keep waiting.
+                        PairingState.CONNECTED -> {
+                            finalizeOnboarding(
+                                deviceId = result.value.deviceId ?: _uiState.value.expectedDeviceId.orEmpty(),
+                                staMac = result.value.staMac.orEmpty(),
+                                lanIp = result.value.lanIp,
+                                ownerToken = result.value.ownerToken,
+                            )
+                            false
+                        }
+                        PairingState.FAILED -> {
+                            _uiState.value = _uiState.value.copy(
+                                step = OnboardingStep.FAILED,
+                                errorMessage = describeFailure(result.value.failureReason),
+                            )
+                            false
+                        }
+                        else -> true // CONNECTING/PAIRING/UNPROVISIONED: keep waiting.
                     }
-                    is ApiResult.Failure -> _uiState.value = _uiState.value.copy(
-                        step = OnboardingStep.FAILED,
-                        errorMessage = "Kehilangan koneksi ke perangkat selama proses (${result.error.errorCode}).",
-                    )
+                    is ApiResult.Failure -> {
+                        recoverPairingStatusOverLan(
+                            pairingToken = token,
+                            configurationId = configurationId,
+                            apError = result.error.errorCode,
+                        )
+                        false
+                    }
+                }
+            }.collect()
+        }
+    }
+
+    /**
+     * ESP8266 changes radio channel when its station interface joins the home AP.  Some Android
+     * versions then retain the setup Wi-Fi association but cannot deliver a further AP HTTP
+     * request.  The device is already reachable on the home LAN at that point, so keep the
+     * original pairing token/configuration id and resume the exact status endpoint over mDNS.
+     */
+    private suspend fun recoverPairingStatusOverLan(
+        pairingToken: String,
+        configurationId: String,
+        apError: String,
+    ) {
+        val deviceId = _uiState.value.expectedDeviceId
+        if (deviceId.isNullOrBlank()) {
+            _uiState.value = _uiState.value.copy(
+                step = OnboardingStep.FAILED,
+                errorMessage = "Kehilangan koneksi ke perangkat selama proses ($apError).",
+            )
+            return
+        }
+        _uiState.value = _uiState.value.copy(step = OnboardingStep.VERIFYING)
+        wifiOnboardingRepository.releaseApBinding()
+        if (!wifiOnboardingRepository.awaitHomeWifiRestored(HOME_WIFI_RESTORE_TIMEOUT_MS)) {
+            _uiState.value = _uiState.value.copy(
+                step = OnboardingStep.FAILED,
+                errorMessage = "HP belum kembali ke Wi-Fi rumah untuk menyelesaikan pemasangan.",
+            )
+            return
+        }
+        var lastProblem = "SmartPlug belum ditemukan di Wi-Fi rumah setelah konfigurasi ($apError)."
+        repeat(LAN_PAIRING_ATTEMPTS) { attempt ->
+            val lanIp = discoveryRepository.resolveDeviceLanIp(
+                deviceId,
+                timeoutMs = LAN_DISCOVERY_ATTEMPT_TIMEOUT_MS,
+            )
+            if (lanIp != null) {
+                when (val lanStatus = pairingRepository.fetchStatusAt(
+                    ApiClientFactory.lanBaseUrl(lanIp), pairingToken, configurationId,
+                )) {
+                    is ApiResult.Success -> when (lanStatus.value.state) {
+                        PairingState.CONNECTED -> {
+                            finalizeOnboarding(
+                                deviceId = lanStatus.value.deviceId ?: deviceId,
+                                staMac = lanStatus.value.staMac.orEmpty(),
+                                lanIp = lanStatus.value.lanIp ?: lanIp,
+                                ownerToken = lanStatus.value.ownerToken,
+                            )
+                            return
+                        }
+                        PairingState.FAILED -> {
+                            _uiState.value = _uiState.value.copy(
+                                step = OnboardingStep.FAILED,
+                                errorMessage = describeFailure(lanStatus.value.failureReason),
+                            )
+                            return
+                        }
+                        else -> lastProblem = "SmartPlug masih menghubungkan ke Wi-Fi rumah."
+                    }
+                    is ApiResult.Failure -> lastProblem =
+                        "Status SmartPlug di Wi-Fi rumah belum dapat dibaca (${lanStatus.error.errorCode})."
                 }
             }
+            if (attempt < LAN_PAIRING_ATTEMPTS - 1) delay(LAN_PAIRING_RETRY_DELAY_MS)
         }
+        _uiState.value = _uiState.value.copy(step = OnboardingStep.FAILED, errorMessage = lastProblem)
     }
 
     private suspend fun finalizeOnboarding(deviceId: String, staMac: String, lanIp: String?, ownerToken: String?) {
@@ -285,10 +346,10 @@ class AddSmartPlugViewModel @Inject constructor(
             staMac = staMac,
             displayName = displayName,
             lanIp = lanIp,
-            integrationMode = if (state.useServer && state.discoveredServer != null) IntegrationMode.SERVER else IntegrationMode.DIRECT,
-            serverId = state.discoveredServer?.serverId,
-            serverHost = state.discoveredServer?.host,
-            serverPort = state.discoveredServer?.port ?: 80,
+            integrationMode = IntegrationMode.DIRECT,
+            serverId = null,
+            serverHost = null,
+            serverPort = 80,
             apUnitId = state.selectedAp?.unitId,
         )
 

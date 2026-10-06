@@ -11,6 +11,9 @@ import com.smartplug.app.data.local.ServerProfileStore
 import com.smartplug.app.domain.model.ApiFailure
 import com.smartplug.app.domain.model.DeviceStatus
 import com.smartplug.app.domain.model.ElectricalMeasurement
+import com.smartplug.app.domain.model.IntegrationMode
+import com.smartplug.app.domain.model.MemberInvitation
+import com.smartplug.app.domain.model.ManagedMember
 import com.smartplug.app.domain.model.RelayCommandStatus
 import com.smartplug.app.domain.model.RelayState
 import com.smartplug.app.domain.model.SmartPlugDevice
@@ -24,6 +27,7 @@ import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.delay
 import java.util.concurrent.TimeUnit
 import javax.inject.Inject
 
@@ -45,6 +49,14 @@ data class DeviceDetailUiState(
     val detectedLoadName: String? = null,
     val vampireEnergySuspected: Boolean = false,
     val registeredServers: List<RegisteredServer> = emptyList(),
+    /** Only the owner may change this SmartPlug's MQTT server route. */
+    val canManageServer: Boolean = false,
+    val memberInvitation: MemberInvitation? = null,
+    val memberInvitationExpiresAtMs: Long = 0L,
+    val isCreatingMemberInvitation: Boolean = false,
+    val managedMembers: List<ManagedMember> = emptyList(),
+    val isLoadingManagedMembers: Boolean = false,
+    val revokingMemberId: String? = null,
 )
 
 data class LiveMeasurementPoint(val timestampMs: Long, val measurement: ElectricalMeasurement)
@@ -76,7 +88,12 @@ class DeviceDetailViewModel @Inject constructor(
     init {
         safeLaunch {
             val device = deviceRepository.getDevice(deviceId)
-            _uiState.value = _uiState.value.copy(device = device, registeredServers = serverProfileStore.all())
+            val canManageServer = device?.let { deviceRepository.canManageServer(it) } ?: false
+            _uiState.value = _uiState.value.copy(
+                device = device,
+                registeredServers = serverProfileStore.all(),
+                canManageServer = canManageServer,
+            )
         }
     }
 
@@ -93,8 +110,38 @@ class DeviceDetailViewModel @Inject constructor(
      * against an uncaught exception here, so this only needs to convert failures into UI state. */
     suspend fun refresh() {
         val device = _uiState.value.device ?: deviceRepository.getDevice(deviceId) ?: return
-        val statusResult = deviceRepository.fetchStatus(device)
-        val measurementResult = deviceRepository.fetchMeasurement(device)
+        // Server mode is deliberately a single atomic `/latest` read. This avoids
+        // duplicate traffic and prevents state/measurement values being composed
+        // from two different server snapshots. Direct mode reads its two
+        // endpoints sequentially: ESP8266WebServer is single-threaded, so two
+        // simultaneous HTTP calls can make an otherwise healthy device close
+        // one socket while it serves the other.
+        val (statusResult, measurementResult) = if (device.integrationMode == IntegrationMode.SERVER) {
+            // `/latest` is an idempotent cache read. The ESP32 may close an idle
+            // HTTP socket between one-second polls, so retry one clean request
+            // before presenting a transient transport failure as offline.
+            when (val snapshot = retryReadOnce { deviceRepository.fetchServerSnapshot(device) }) {
+                is ApiResult.Success -> ApiResult.Success(snapshot.value.status) to ApiResult.Success(snapshot.value.measurement)
+                is ApiResult.Failure -> snapshot to snapshot
+            }
+        } else {
+            retryReadOnce { deviceRepository.fetchStatus(device) } to
+                retryReadOnce { deviceRepository.fetchMeasurement(device) }
+        }
+
+        // A Server -> Direct (or Direct -> Server) change is allowed while the
+        // visible poll is in flight.  Never let that older response write its
+        // route back into UI state: it would make a successfully disconnected
+        // Direct device appear offline until a later recreation.  The next
+        // one-second poll uses the persisted, newly selected route instead.
+        val currentDevice = _uiState.value.device ?: deviceRepository.getDevice(deviceId) ?: return
+        if (currentDevice.integrationMode != device.integrationMode ||
+            currentDevice.serverId != device.serverId ||
+            currentDevice.serverHost != device.serverHost ||
+            currentDevice.serverPort != device.serverPort ||
+            currentDevice.lanIp != device.lanIp) {
+            return
+        }
 
         val successfulMeasurement = (measurementResult as? ApiResult.Success)?.value
         if (successfulMeasurement != null) recordMeasurement(device.deviceId, successfulMeasurement)
@@ -122,6 +169,19 @@ class DeviceDetailViewModel @Inject constructor(
             lastError = ((statusResult as? ApiResult.Failure)?.error ?: (measurementResult as? ApiResult.Failure)?.error)
                 ?.let(::describeError),
         )
+    }
+
+    /**
+     * The ESP8266 local server may close a just-idle TCP socket while Wi-Fi
+     * changes state.  Direct reads are idempotent, so retry one failed read on
+     * a clean, still-serial request. A second failure remains visible to the
+     * user; this is not an offline-state suppression mechanism.
+     */
+    private suspend fun <T> retryReadOnce(read: suspend () -> ApiResult<T>): ApiResult<T> {
+        val first = read()
+        if (first is ApiResult.Success) return first
+        delay(DIRECT_READ_RETRY_DELAY_MS)
+        return read()
     }
 
     /** A standby pattern, not a statement that the load is faulty: 0.5–10 W,
@@ -268,34 +328,24 @@ class DeviceDetailViewModel @Inject constructor(
                 )
             }
             // Always re-sync from the source of truth rather than trusting our own optimistic state.
+            // Preserve a terminal command error: refresh() only describes status-read failures,
+            // so it must not make a rejected/timeout relay command look successful.
+            val commandError = _uiState.value.lastError
             refresh()
+            if (commandError != null) {
+                _uiState.value = _uiState.value.copy(lastError = commandError)
+            }
         }
     }
 
     fun renameDevice(newName: String) {
-        safeLaunch {
-            deviceRepository.renameDevice(deviceId, newName)
-            _uiState.value = _uiState.value.copy(device = _uiState.value.device?.copy(displayName = newName))
-        }
-    }
-
-    fun connectToServer(serverId: String, host: String, port: Int, username: String, password: String, apiToken: String) {
         val device = _uiState.value.device ?: return
-        if (serverId.isBlank() || host.isBlank() || port !in 1..65535) {
-            _uiState.value = _uiState.value.copy(lastError = "Profil ServerSmartPlug tidak valid.")
-            return
-        }
         safeLaunch {
-            when (val result = deviceRepository.connectToServer(device, ServerConnectionProfile(
-                serverId = serverId.trim(), brokerHost = host.trim(), brokerPort = port,
-                mqttUsername = username.trim(), mqttPassword = password, baseTopic = "smartplug/${device.deviceId}",
-            ))) {
+            when (val result = deviceControlRepository.setSharedDisplayName(device, newName)) {
                 is ApiResult.Success -> {
-                    serverProfileStore.save(RegisteredServer(serverId.trim(), serverId.trim(), host.trim(), port, username.trim(), password), apiToken)
-                    _uiState.value = _uiState.value.copy(
-                        device = device.copy(integrationMode = com.smartplug.app.domain.model.IntegrationMode.SERVER, serverId = serverId.trim(), serverHost = host.trim()),
-                        registeredServers = serverProfileStore.all(), lastError = null,
-                    )
+                    val normalized = newName.trim()
+                    deviceRepository.renameDevice(deviceId, normalized)
+                    _uiState.value = _uiState.value.copy(device = device.copy(displayName = normalized))
                 }
                 is ApiResult.Failure -> _uiState.value = _uiState.value.copy(lastError = describeError(result.error))
             }
@@ -303,16 +353,45 @@ class DeviceDetailViewModel @Inject constructor(
     }
 
     fun connectSavedServer(server: RegisteredServer) {
-        val token = serverProfileStore.apiToken(server.serverId)
-        if (token.isNullOrBlank()) {
-            _uiState.value = _uiState.value.copy(lastError = "Token API server tidak tersedia. Simpan ulang profil server.")
+        val device = _uiState.value.device ?: return
+        if (!_uiState.value.canManageServer) {
+            _uiState.value = _uiState.value.copy(lastError = "Hanya pemilik SmartPlug yang dapat mengubah koneksi server.")
             return
         }
-        connectToServer(server.serverId, server.host, server.mqttPort, server.mqttUsername, server.mqttPassword, token)
+        // Server profiles are created only by the separate ServerSmartPlug onboarding flow.
+        // Never mutate that profile here; update this one SmartPlug only after its local REST
+        // endpoint accepts the selected MQTT settings.
+        safeLaunch {
+            when (val result = deviceRepository.connectToServer(
+                device,
+                ServerConnectionProfile(
+                    serverId = server.serverId,
+                    brokerHost = server.host,
+                    brokerPort = server.mqttPort,
+                    mqttUsername = server.mqttUsername,
+                    mqttPassword = server.mqttPassword,
+                    baseTopic = "smartplug/${device.deviceId}",
+                ),
+            )) {
+                is ApiResult.Success -> _uiState.value = _uiState.value.copy(
+                    device = device.copy(
+                        integrationMode = com.smartplug.app.domain.model.IntegrationMode.SERVER,
+                        serverId = server.serverId,
+                        serverHost = server.host,
+                    ),
+                    lastError = null,
+                )
+                is ApiResult.Failure -> _uiState.value = _uiState.value.copy(lastError = describeError(result.error))
+            }
+        }
     }
 
     fun disconnectFromServer() {
         val device = _uiState.value.device ?: return
+        if (!_uiState.value.canManageServer) {
+            _uiState.value = _uiState.value.copy(lastError = "Hanya pemilik SmartPlug yang dapat mengubah koneksi server.")
+            return
+        }
         safeLaunch {
             when (val result = deviceRepository.disconnectFromServer(device)) {
                 is ApiResult.Success -> _uiState.value = _uiState.value.copy(
@@ -346,14 +425,93 @@ class DeviceDetailViewModel @Inject constructor(
 
     fun factoryReset() = runControl("Factory reset ditolak") { device -> deviceControlRepository.factoryReset(device) }
 
-    fun applyTimer(days: Int, hours: Int, minutes: Int, seconds: Int) =
-        runControl("Timer tidak dapat diterapkan") { device ->
-            deviceControlRepository.applyTimer(device, days, hours, minutes, seconds)
+    fun applyTimer(hours: Int, minutes: Int, seconds: Int, onSuccess: () -> Unit) {
+        // The composable disables Apply at zero, but keep the command boundary
+        // defensive so an accessibility action or future UI cannot send an
+        // invalid all-zero timer request to the SmartPlug/server.
+        if (hours !in 0..99 || minutes !in 0..59 || seconds !in 0..59 ||
+            (hours == 0 && minutes == 0 && seconds == 0)
+        ) {
+            _uiState.value = _uiState.value.copy(lastError = "Durasi timer tidak valid.")
+            return
         }
+        runControl("Timer tidak dapat diterapkan", onSuccess) { device ->
+            // The product UI intentionally has no day selector. Preserve the existing
+            // firmware/server contract by converting a Clock-style total-hour wheel
+            // into its days + hours wire representation internally.
+            deviceControlRepository.applyTimer(device, hours / 24, hours % 24, minutes, seconds)
+        }
+    }
 
-    fun resetTimer() = runControl("Timer tidak dapat direset") { device -> deviceControlRepository.resetTimer(device) }
+    fun resetTimer(onSuccess: () -> Unit) =
+        runControl("Timer tidak dapat direset", onSuccess) { device -> deviceControlRepository.resetTimer(device) }
 
-    private fun runControl(fallback: String, action: suspend (SmartPlugDevice) -> ApiResult<Unit>) {
+    fun createMemberInvitation() {
+        val device = _uiState.value.device ?: return
+        safeLaunch(onError = {
+            _uiState.value = _uiState.value.copy(isCreatingMemberInvitation = false, lastError = "Kode undangan tidak dapat dibuat.")
+        }) {
+            _uiState.value = _uiState.value.copy(
+                isCreatingMemberInvitation = true,
+                memberInvitation = null,
+                memberInvitationExpiresAtMs = 0L,
+                lastError = null,
+            )
+            when (val result = deviceControlRepository.createMemberInvitation(device)) {
+                is ApiResult.Success -> _uiState.value = _uiState.value.copy(
+                    isCreatingMemberInvitation = false,
+                    memberInvitation = result.value,
+                    memberInvitationExpiresAtMs = System.currentTimeMillis() + result.value.expiresInSeconds * 1000L,
+                )
+                is ApiResult.Failure -> _uiState.value = _uiState.value.copy(
+                    isCreatingMemberInvitation = false,
+                    lastError = describeError(result.error),
+                )
+            }
+        }
+    }
+
+    fun loadManagedMembers() {
+        val device = _uiState.value.device ?: return
+        safeLaunch(onError = {
+            _uiState.value = _uiState.value.copy(isLoadingManagedMembers = false, lastError = "Daftar HP tidak dapat dimuat.")
+        }) {
+            _uiState.value = _uiState.value.copy(isLoadingManagedMembers = true, lastError = null)
+            when (val result = deviceControlRepository.listManagedMembers(device)) {
+                is ApiResult.Success -> _uiState.value = _uiState.value.copy(
+                    isLoadingManagedMembers = false, managedMembers = result.value, lastError = null,
+                )
+                is ApiResult.Failure -> _uiState.value = _uiState.value.copy(
+                    isLoadingManagedMembers = false, lastError = describeError(result.error),
+                )
+            }
+        }
+    }
+
+    fun revokeManagedMember(credentialId: String) {
+        val device = _uiState.value.device ?: return
+        safeLaunch(onError = {
+            _uiState.value = _uiState.value.copy(revokingMemberId = null, lastError = "Akses HP tidak dapat dicabut.")
+        }) {
+            _uiState.value = _uiState.value.copy(revokingMemberId = credentialId, lastError = null)
+            when (val result = deviceControlRepository.revokeManagedMember(device, credentialId)) {
+                is ApiResult.Success -> _uiState.value = _uiState.value.copy(
+                    revokingMemberId = null,
+                    managedMembers = _uiState.value.managedMembers.filterNot { it.credentialId == credentialId },
+                    lastError = null,
+                )
+                is ApiResult.Failure -> _uiState.value = _uiState.value.copy(
+                    revokingMemberId = null, lastError = describeError(result.error),
+                )
+            }
+        }
+    }
+
+    private fun runControl(
+        fallback: String,
+        onSuccess: () -> Unit = {},
+        action: suspend (SmartPlugDevice) -> ApiResult<Unit>,
+    ) {
         val device = _uiState.value.device ?: return
         safeLaunch(onError = {
             _uiState.value = _uiState.value.copy(lastError = fallback)
@@ -361,6 +519,11 @@ class DeviceDetailViewModel @Inject constructor(
             when (val result = action(device)) {
                 is ApiResult.Success -> {
                     _uiState.value = _uiState.value.copy(lastError = null)
+                    // A control response is the authoritative acceptance of the
+                    // action.  TimerDialog must close on that response, not be
+                    // held open by a best-effort follow-up status refresh that
+                    // may fail independently after the command has succeeded.
+                    onSuccess()
                     refresh()
                 }
                 is ApiResult.Failure -> _uiState.value = _uiState.value.copy(lastError = describeError(result.error))
@@ -383,6 +546,7 @@ class DeviceDetailViewModel @Inject constructor(
 
     private companion object {
         const val LOCAL_HISTORY_RESOLUTION = "local_1m"
+        const val DIRECT_READ_RETRY_DELAY_MS = 150L
         val VAMPIRE_WINDOW_MS = TimeUnit.MINUTES.toMillis(15)
     }
 }

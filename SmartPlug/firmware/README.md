@@ -31,7 +31,7 @@ reset/rollover, dan menjalankan uji regresi native. Lihat
 ServerSmartPlug tetap memakai revisi R3.8.0; kontrak topic dan satuan Wh tidak berubah.
 
 Firmware SmartPlug ESP8266 memakai satu image dengan pilihan mode runtime:
-`esp07_factory` untuk provisioning unit baru, atau `esp07_product` untuk
+`esp07_factory` untuk provisioning unit baru, atau `smartplug_product` untuk
 kompatibilitas unit lama. Setelah perangkat
 terhubung ke Wi-Fi lokasi, administrator memilih satu jalur integrasi aktif:
 **REST API** untuk aplikasi LAN atau **MQTT** untuk broker. Access Point lokal
@@ -41,7 +41,7 @@ Rilis integrasi R3.8 terdiri dari dua firmware produk:
 
 | Firmware | Target | Peran |
 |---|---|---|
-| `SmartPlug/firmware`, environment `esp07_product` | ESP8266 | Metering, relay latching, commissioning AP, serta mode REST atau MQTT yang dapat dipilih saat runtime. |
+| `SmartPlug/firmware`, environment `smartplug_product` | ESP8266 | Metering, relay latching, commissioning AP, serta mode REST atau MQTT yang dapat dipilih saat runtime. |
 | `ServerSmartPlug`, environment `server_esp32` | ESP32 | Broker MQTT, REST API aplikasi, penyimpanan SD, histori satu menit, dan sinkronisasi energi. |
 
 Environment `esp07_rest`, `esp07_mqtt`, dan `esp07_safe` dipertahankan hanya
@@ -95,7 +95,7 @@ menghapus checkpoint energi lalu menyiapkan filesystem kosong.
 ## Build
 
 ```powershell
-pio run -d D:\IoT\SmartPlug\firmware -e esp07_product
+pio run -d D:\IoT\SmartPlug\firmware -e smartplug_product
 ```
 
 Protocol unit tests require a host C++ compiler:
@@ -104,7 +104,7 @@ Protocol unit tests require a host C++ compiler:
 pio test -d D:\IoT\SmartPlug\firmware -e native_protocol_tests
 ```
 
-Image `esp07_product` memiliki dukungan MQTT, tetapi mode awalnya adalah REST
+Image `smartplug_product` memiliki dukungan MQTT, tetapi mode awalnya adalah REST
 sampai administrator menyimpan konfigurasi MQTT yang valid dari Access Point.
 
 ## Verifikasi build
@@ -112,7 +112,7 @@ sampai administrator menyimpan konfigurasi MQTT yang valid dari Access Point.
 Hasil di bawah adalah catatan historis R3.8.0. Hasil build source terkini ada di
 `ENERGY-TEST-STATUS-R3.8.1.md`.
 
-`esp07_product` R3.8.0 dikompilasi untuk target ESP8266/ESP-07 dengan
+`smartplug_product` R3.8.0 dikompilasi untuk target ESP8266/ESP-07 dengan
 `espressif8266@4.2.1`. Build menghasilkan binary 393,539 byte dari batas
 434,160 byte image 512 KB. Hasil build membuktikan source dapat dikompilasi;
 hasil tersebut bukan bukti flashing, boot, pembacaan meter, relay, Wi-Fi, atau

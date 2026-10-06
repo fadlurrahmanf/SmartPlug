@@ -10,6 +10,7 @@ import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import com.smartplug.app.ui.components.AppScaffold
 import com.smartplug.app.ui.screens.addplug.AddSmartPlugScreen
+import com.smartplug.app.ui.screens.addexisting.AddExistingSmartPlugScreen
 import com.smartplug.app.ui.screens.addserver.AddServerScreen
 import com.smartplug.app.ui.screens.devicedetail.DeviceDetailScreen
 import com.smartplug.app.ui.screens.devices.DeviceListScreen
@@ -54,7 +55,7 @@ fun SmartPlugNavHost(
                     onOpenDevice = { deviceId ->
                         navController.navigate(Routes.DeviceDetail.createRoute(deviceId))
                     },
-                    onAddSmartPlug = { navController.navigate(Routes.AddSmartPlug.route) },
+                    onAddDevice = { navController.navigate(Routes.Devices.route) },
                 )
             }
             composable(Routes.Devices.route) {
@@ -63,6 +64,7 @@ fun SmartPlugNavHost(
                         navController.navigate(Routes.DeviceDetail.createRoute(deviceId))
                     },
                     onAddSmartPlug = { navController.navigate(Routes.AddSmartPlug.route) },
+                    onAddExistingSmartPlug = { navController.navigate(Routes.AddExistingSmartPlug.route) },
                     onAddServer = { navController.navigate(Routes.AddServer.route) },
                 )
             }
@@ -76,11 +78,28 @@ fun SmartPlugNavHost(
                     onCancel = { navController.popBackStack() },
                 )
             }
+            composable(Routes.AddExistingSmartPlug.route) {
+                AddExistingSmartPlugScreen(
+                    onFinished = { deviceId ->
+                        navController.navigate(Routes.DeviceDetail.createRoute(deviceId)) {
+                            popUpTo(Routes.AddExistingSmartPlug.route) { inclusive = true }
+                        }
+                    },
+                    onCancel = { navController.popBackStack() },
+                )
+            }
             composable(Routes.AddServer.route) {
                 AddServerScreen(onDone = { navController.popBackStack() }, onBack = { navController.popBackStack() })
             }
             composable(Routes.Settings.route) {
-                SettingsScreen()
+                SettingsScreen(
+                    onResetCompleted = {
+                        navController.navigate(Routes.Devices.route) {
+                            popUpTo(navController.graph.id) { inclusive = true }
+                            launchSingleTop = true
+                        }
+                    },
+                )
             }
             composable(Routes.DeviceDetail.route) { entry ->
                 val deviceId = entry.arguments?.getString(Routes.DeviceDetail.ARG_DEVICE_ID).orEmpty()

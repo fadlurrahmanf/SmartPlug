@@ -6,6 +6,8 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -19,6 +21,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -34,17 +37,33 @@ import com.smartplug.app.ui.components.SmartPlugCard
 import com.smartplug.app.ui.localization.AppLanguage
 import com.smartplug.app.ui.localization.LocalAppLanguage
 import com.smartplug.app.ui.localization.localized
+import com.smartplug.app.domain.model.RegisteredServer
+import com.smartplug.app.domain.model.SmartPlugDevice
 
 @Composable
-fun SettingsScreen(viewModel: SettingsViewModel = hiltViewModel()) {
+fun SettingsScreen(
+    onResetCompleted: () -> Unit,
+    viewModel: SettingsViewModel = hiltViewModel(),
+) {
     val settings by viewModel.settings.collectAsStateWithLifecycle()
     val appResetState by viewModel.appResetState.collectAsStateWithLifecycle()
+    val registeredDevices by viewModel.registeredDevices.collectAsStateWithLifecycle()
+    val registeredServers by viewModel.registeredServers.collectAsStateWithLifecycle()
     val language = LocalAppLanguage.current
     var showAppResetConfirmation by remember { mutableStateOf(false) }
+    var smartPlugPendingUnpair by remember { mutableStateOf<SmartPlugDevice?>(null) }
+    var serverPendingUnpair by remember { mutableStateOf<RegisteredServer?>(null) }
+
+    // A reset deletes the credentials backing any device-detail screen.  Return to the
+    // safe device list instead of leaving an obsolete detail route that can show
+    // `missing_owner_token` after a successful reset.
+    LaunchedEffect(appResetState.completed) {
+        if (appResetState.completed) onResetCompleted()
+    }
 
     Scaffold(topBar = { TopAppBar(title = { androidx.compose.material3.Text(localized(language, "Pengaturan", "Settings")) }) }) { padding ->
         Column(
-            modifier = Modifier.fillMaxSize().padding(padding).padding(16.dp),
+            modifier = Modifier.fillMaxSize().padding(padding).verticalScroll(rememberScrollState()).padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             SmartPlugCard {
@@ -84,12 +103,64 @@ fun SettingsScreen(viewModel: SettingsViewModel = hiltViewModel()) {
             }
 
             SmartPlugCard {
+                Text(localized(language, "Perangkat tersimpan", "Saved devices"), style = MaterialTheme.typography.titleMedium)
+                Text(
+                    localized(
+                        language,
+                        "Daftar utama tetap hanya menampilkan SmartPlug. Kelola profil SmartPlug dan ServerSmartPlug dari sini.",
+                        "The main device list stays SmartPlug-only. Manage SmartPlug and ServerSmartPlug profiles here.",
+                    ),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(top = 4.dp),
+                )
+                if (registeredDevices.isEmpty() && registeredServers.isEmpty()) {
+                    Text(localized(language, "Belum ada perangkat tersimpan.", "No saved devices."), modifier = Modifier.padding(top = 12.dp))
+                } else {
+                    if (registeredDevices.isNotEmpty()) {
+                        Text(
+                            "SmartPlug",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.padding(top = 16.dp),
+                        )
+                    }
+                    registeredDevices.forEach { device ->
+                        SavedProfileRow(
+                            title = device.displayName,
+                            subtitle = localized(
+                                language,
+                                "SmartPlug · ${if (device.integrationMode.name == "SERVER") "Server" else "Direct"}",
+                                "SmartPlug · ${if (device.integrationMode.name == "SERVER") "Server" else "Direct"}",
+                            ),
+                            onUnpair = { smartPlugPendingUnpair = device },
+                        )
+                    }
+                    if (registeredServers.isNotEmpty()) {
+                        Text(
+                            "Server",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.padding(top = 16.dp),
+                        )
+                    }
+                    registeredServers.forEach { server ->
+                        SavedProfileRow(
+                            title = server.displayName,
+                            subtitle = "Server · ${server.host}",
+                            onUnpair = { serverPendingUnpair = server },
+                        )
+                    }
+                }
+            }
+
+            SmartPlugCard {
                 Text(localized(language, "Reset aplikasi", "Reset app"), style = MaterialTheme.typography.titleMedium)
                 Text(
                     localized(
                         language,
-                        "Factory reset seluruh perangkat yang terdaftar, lalu hapus perangkat, riwayat, nama beban, dan kredensial dari aplikasi.",
-                        "Factory-reset every registered device, then remove devices, history, load names, and credentials from the app.",
+                        "Factory reset seluruh SmartPlug dan ServerSmartPlug yang terdaftar, lalu hapus perangkat, riwayat, nama beban, dan kredensial dari aplikasi.",
+                        "Factory-reset every registered SmartPlug and ServerSmartPlug, then remove devices, history, load names, and credentials from the app.",
                     ),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -98,6 +169,10 @@ fun SettingsScreen(viewModel: SettingsViewModel = hiltViewModel()) {
                 Button(
                     onClick = { showAppResetConfirmation = true },
                     enabled = !appResetState.isRunning,
+                    colors = androidx.compose.material3.ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.error,
+                        contentColor = androidx.compose.ui.graphics.Color.White,
+                    ),
                 ) {
                     Text(if (appResetState.isRunning) localized(language, "Mereset…", "Resetting…") else localized(language, "Reset aplikasi & perangkat", "Reset app & devices"))
                 }
@@ -135,6 +210,67 @@ fun SettingsScreen(viewModel: SettingsViewModel = hiltViewModel()) {
             },
         )
     }
+    smartPlugPendingUnpair?.let { device ->
+        LocalUnpairConfirmationDialog(
+            language = language,
+            title = localized(language, "Lepas SmartPlug dari aplikasi?", "Unpair SmartPlug from this app?"),
+            description = localized(
+                language,
+                "Ini hanya menghapus profil, riwayat, dan kredensial SmartPlug dari HP ini. SmartPlug tidak di-factory-reset.",
+                "This only removes the SmartPlug profile, history, and credential from this phone. The SmartPlug is not factory-reset.",
+            ),
+            onConfirm = { viewModel.unpairSmartPlug(device); smartPlugPendingUnpair = null },
+            onDismiss = { smartPlugPendingUnpair = null },
+        )
+    }
+    serverPendingUnpair?.let { server ->
+        LocalUnpairConfirmationDialog(
+            language = language,
+            title = localized(language, "Lepas ServerSmartPlug dari aplikasi?", "Unpair ServerSmartPlug from this app?"),
+            description = localized(
+                language,
+                "Ini hanya menghapus profil dan token server dari HP ini. Server dan SmartPlug yang terhubung tidak di-reset atau diubah.",
+                "This only removes the server profile and token from this phone. The server and connected SmartPlugs are not reset or changed.",
+            ),
+            onConfirm = { viewModel.unpairServer(server); serverPendingUnpair = null },
+            onDismiss = { serverPendingUnpair = null },
+        )
+    }
+}
+
+@Composable
+private fun SavedProfileRow(title: String, subtitle: String, onUnpair: () -> Unit) {
+    val language = LocalAppLanguage.current
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(title, style = MaterialTheme.typography.bodyLarge)
+            Text(subtitle, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        TextButton(onClick = onUnpair) {
+            Text(localized(language, "Lepas", "Unpair"), color = MaterialTheme.colorScheme.error)
+        }
+    }
+}
+
+@Composable
+private fun LocalUnpairConfirmationDialog(
+    language: AppLanguage,
+    title: String,
+    description: String,
+    onConfirm: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(title) },
+        text = { Text(description) },
+        confirmButton = { TextButton(onClick = onConfirm) { Text(localized(language, "Lepas", "Unpair"), color = MaterialTheme.colorScheme.error) } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text(localized(language, "Batal", "Cancel")) } },
+    )
 }
 
 @Composable
@@ -146,14 +282,14 @@ private fun AppResetConfirmationDialog(
     var phrase by remember { mutableStateOf("") }
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text(localized(language, "Reset aplikasi dan semua perangkat?", "Reset app and all devices?")) },
+        title = { Text(localized(language, "Reset aplikasi, SmartPlug, dan server?", "Reset app, SmartPlug, and servers?")) },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text(
                     localized(
                         language,
-                        "Setiap perangkat yang masih dapat dihubungi akan menerima factory reset dengan konfirmasi tiga tahap. Perangkat offline tidak akan dihapus agar dapat dicoba lagi.",
-                        "Each reachable device receives a triple-confirmed factory reset. Offline devices remain in the app so they can be retried.",
+                        "Setiap SmartPlug dan ServerSmartPlug yang masih dapat dihubungi akan menerima factory reset dengan konfirmasi tiga tahap. Target offline tidak dihapus agar dapat dicoba lagi.",
+                        "Each reachable SmartPlug and ServerSmartPlug receives a triple-confirmed factory reset. Offline targets remain in the app so they can be retried.",
                     ),
                 )
                 OutlinedTextField(

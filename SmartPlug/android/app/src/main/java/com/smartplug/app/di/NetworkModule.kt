@@ -29,12 +29,15 @@ object NetworkModule {
             .connectTimeout(5, TimeUnit.SECONDS)
             .readTimeout(8, TimeUnit.SECONDS)
             .writeTimeout(8, TimeUnit.SECONDS)
-            // SmartPlug/ServerSmartPlug never send credentials in the URL; no logging redaction
-            // needed beyond keeping this at BASIC in release builds.
+            // Pairing and server configuration deliberately carry secrets in request bodies,
+            // while operational calls carry an owner bearer token.  Keep debug diagnostics to
+            // request/response lines only and redact the bearer header so logcat never becomes
+            // a credential store on a distributed device.
             .addInterceptor(
                 HttpLoggingInterceptor().apply {
+                    redactHeader("Authorization")
                     level = if (BuildConfig.DEBUG) {
-                        HttpLoggingInterceptor.Level.BODY
+                        HttpLoggingInterceptor.Level.BASIC
                     } else {
                         HttpLoggingInterceptor.Level.NONE
                     }

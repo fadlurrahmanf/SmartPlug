@@ -5,6 +5,41 @@ import com.squareup.moshi.JsonClass
 
 /** DTOs for ServerSmartPlug's application REST API, design.md "REST API aplikasi ke server". */
 
+/**
+ * One-time SPMQTT2 provisioning material.  The value is generated for one
+ * connect attempt, sent only to the registered ServerSmartPlug and local
+ * SmartPlug over authenticated REST, and deliberately never persisted.
+ */
+@JsonClass(generateAdapter = true)
+data class MqttAuthDeviceRequestDto(
+    @Json(name = "signing_secret") val signingSecret: String,
+)
+
+/** Typed payloads avoid Kotlin's `Map<String, *>` wildcard at the Retrofit boundary.
+ * The ServerSmartPlug accepts the same JSON field names as before. */
+@JsonClass(generateAdapter = true)
+data class ServerTimerRequestDto(
+    @Json(name = "action") val action: String,
+    @Json(name = "days") val days: Int? = null,
+    @Json(name = "hours") val hours: Int? = null,
+    @Json(name = "minutes") val minutes: Int? = null,
+    @Json(name = "seconds") val seconds: Int? = null,
+)
+
+@JsonClass(generateAdapter = true)
+data class ServerScheduleRequestDto(
+    @Json(name = "action") val action: String,
+    @Json(name = "timezone_offset_minutes") val timezoneOffsetMinutes: Int? = null,
+    @Json(name = "enabled") val enabled: Boolean? = null,
+    @Json(name = "hour") val hour: Int? = null,
+    @Json(name = "minute") val minute: Int? = null,
+    @Json(name = "state") val state: String? = null,
+    @Json(name = "event") val event: String? = null,
+    @Json(name = "index") val index: Int? = null,
+    @Json(name = "from") val from: Int? = null,
+    @Json(name = "to") val to: Int? = null,
+)
+
 @JsonClass(generateAdapter = true)
 data class ServerDeviceDto(
     @Json(name = "device_id") val deviceId: String,

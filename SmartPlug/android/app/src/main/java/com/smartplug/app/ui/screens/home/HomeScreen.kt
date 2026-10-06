@@ -8,25 +8,35 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.material3.Button
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.compositeOver
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.smartplug.app.ui.components.AnimatedDecimal
 import com.smartplug.app.ui.components.EmptyState
 import com.smartplug.app.ui.components.PollWhileVisible
+import com.smartplug.app.ui.components.PulsingDot
 import com.smartplug.app.ui.components.SmartPlugCard
+import com.smartplug.app.ui.components.TickChart
+import com.smartplug.app.ui.components.entrance
 import com.smartplug.app.ui.screens.devices.DeviceListViewModel
+import com.smartplug.app.ui.theme.AccentGreen
+import com.smartplug.app.ui.theme.AccentRed
 import com.smartplug.app.util.PollingCadence
 import com.smartplug.app.ui.localization.LocalAppLanguage
 import com.smartplug.app.ui.localization.localized
@@ -36,7 +46,7 @@ import java.util.Locale
 @Composable
 fun HomeScreen(
     onOpenDevice: (String) -> Unit,
-    onAddSmartPlug: () -> Unit,
+    onAddDevice: () -> Unit,
     viewModel: DeviceListViewModel = hiltViewModel(),
 ) {
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
@@ -46,13 +56,13 @@ fun HomeScreen(
         viewModel.refreshAll()
     }
 
-    Scaffold(topBar = { TopAppBar(title = { Text("SmartPlug") }) }) { padding ->
+    Scaffold(topBar = { TopAppBar(title = { Text(localized(language, "Beranda", "Home")) }) }) { padding ->
         if (uiState.rows.isEmpty()) {
             EmptyState(
                 title = localized(language, "Selamat datang di SmartPlug", "Welcome to SmartPlug"),
                 description = localized(language, "Pantau konsumsi energi dan kendalikan relay dari satu aplikasi.", "Monitor energy use and control relays from one app."),
                 modifier = Modifier.padding(padding),
-                action = { Button(onClick = onAddSmartPlug) { Text(localized(language, "Tambah SmartPlug", "Add SmartPlug")) } },
+                action = { Button(onClick = onAddDevice) { Text(localized(language, "Tambah Perangkat", "Add Device")) } },
             )
             return@Scaffold
         }
@@ -61,6 +71,8 @@ fun HomeScreen(
         val readableRows = uiState.rows.filter { it.measurement != null }
         val totalPower = readableRows.sumOf { it.measurement?.activePowerW?.coerceAtLeast(0.0) ?: 0.0 }
         val totalKwh = readableRows.sumOf { (it.measurement?.energyWh ?: 0.0).coerceAtLeast(0.0) / 1000.0 }
+        val todayTotal = readableRows.mapNotNull { uiState.todayKwh[it.device.deviceId] }.takeIf { it.isNotEmpty() }?.sum()
+        val heroColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.16f).compositeOver(MaterialTheme.colorScheme.surface)
 
         LazyColumn(
             modifier = Modifier.fillMaxSize().padding(padding),
@@ -68,58 +80,114 @@ fun HomeScreen(
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             item {
-                SmartPlugCard(containerColor = MaterialTheme.colorScheme.primaryContainer) {
-                    Text(localized(language, "Ringkasan rumah", "Home overview"), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                SmartPlugCard(modifier = Modifier.entrance(0), containerColor = heroColor) {
                     Text(
-                        localized(language, "$onlineCount dari ${uiState.rows.size} SmartPlug online", "$onlineCount of ${uiState.rows.size} SmartPlugs online"),
-                        style = MaterialTheme.typography.bodyMedium,
+                        localized(language, "Total energi · $onlineCount dari ${uiState.rows.size} online", "Total energy · $onlineCount of ${uiState.rows.size} online"),
+                        style = MaterialTheme.typography.labelLarge,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.fillMaxWidth(),
+                        textAlign = TextAlign.Center,
                     )
-                    Row(modifier = Modifier.fillMaxWidth().padding(top = 14.dp)) {
-                        OverviewValue(
-                            localized(language, "Total daya aktif", "Total active power"),
-                            "${format1(totalPower)} W",
-                            Modifier.weight(1f),
+                    Row(modifier = Modifier.fillMaxWidth().padding(top = 8.dp), horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.Bottom) {
+                        AnimatedDecimal(
+                            value = totalKwh,
+                            decimals = 3,
+                            style = MaterialTheme.typography.displayMedium,
+                            fontWeight = FontWeight.Bold,
                         )
-                        OverviewValue(
-                            localized(language, "Total energi", "Total energy"),
-                            "${formatKwh(totalKwh)} kWh",
-                            Modifier.weight(1f),
+                        Text(
+                            " kWh",
+                            style = MaterialTheme.typography.titleMedium,
+                            color = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.padding(bottom = 8.dp),
+                        )
+                    }
+                    todayTotal?.let { today ->
+                        Text(
+                            localized(language, "▲ +${formatKwh(today)} kWh hari ini", "▲ +${formatKwh(today)} kWh today"),
+                            style = MaterialTheme.typography.labelLarge,
+                            color = AccentGreen,
+                            modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
+                            textAlign = TextAlign.Center,
+                        )
+                    }
+                    if (uiState.todaySeries.size >= 2) {
+                        val series = uiState.todaySeries
+                        val clock = java.text.SimpleDateFormat("HH:mm", Locale.US)
+                        // Few minutes of data: label only start and end so ticks never overlap.
+                        val spanMs = series.last().first - series.first().first
+                        val labels = if (spanMs < 30 * 60_000L) {
+                            listOf(clock.format(java.util.Date(series.first().first)), localized(language, "sekarang", "now"))
+                        } else {
+                            (0..4).map { j ->
+                                if (j == 4) localized(language, "sekarang", "now")
+                                else clock.format(java.util.Date(series[(series.size - 1) * j / 4].first))
+                            }
+                        }
+                        TickChart(
+                            values = series.map { it.second },
+                            xLabels = labels,
+                            color = MaterialTheme.colorScheme.primary,
+                            height = 160.dp,
+                            modifier = Modifier.padding(top = 12.dp),
                         )
                     }
                 }
             }
             item {
-                Text(localized(language, "Perangkat", "Devices"), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                Row(modifier = Modifier.fillMaxWidth().entrance(1), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    SmartPlugCard(modifier = Modifier.weight(1f)) {
+                        Text(localized(language, "Hari ini", "Today"), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text(todayTotal?.let { formatKwh(it) } ?: "–", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold, fontFamily = com.smartplug.app.ui.theme.SmartPlugMono)
+                        Text("kWh", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    SmartPlugCard(modifier = Modifier.weight(1f)) {
+                        Text(localized(language, "Daya sekarang", "Power now"), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        AnimatedDecimal(value = totalPower, decimals = 1, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                        Text("W", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
             }
-            items(uiState.rows, key = { it.device.deviceId }) { row ->
-                SmartPlugCard(modifier = Modifier.fillMaxWidth().clickable { onOpenDevice(row.device.deviceId) }) {
-                    Column {
-                        Row(modifier = Modifier.fillMaxWidth()) {
-                            Text(row.device.displayName, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
-                            Text(if (row.online) "●" else "●", color = if (row.online) Color(0xFF208B5D) else Color(0xFFC23B3B))
-                        }
+            item {
+                Text(
+                    localized(language, "Perangkat", "Devices"),
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.entrance(2),
+                )
+            }
+            itemsIndexed(uiState.rows, key = { _, row -> row.device.deviceId }) { index, row ->
+                SmartPlugCard(modifier = Modifier.fillMaxWidth().entrance(index + 3).clickable { onOpenDevice(row.device.deviceId) }) {
+                    Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Text(row.device.displayName, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
+                        PulsingDot(color = if (row.online) AccentGreen else AccentRed, active = row.online)
+                    }
+                    val measurement = row.measurement
+                    if (measurement == null) {
                         Text(
-                            if (row.online) localized(language, "Online", "Online") else localized(language, "Offline", "Offline"),
+                            localized(language, "Offline", "Offline"),
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
-                        row.measurement?.let { measurement ->
-                            val power = measurement.activePowerW.coerceAtLeast(0.0)
-                            val kwh = measurement.energyWh.coerceAtLeast(0.0) / 1000.0
-                            val powerPercent = if (totalPower > 0.0) power / totalPower * 100.0 else 0.0
-                            val kwhPercent = if (totalKwh > 0.0) kwh / totalKwh * 100.0 else 0.0
-                            Text(
-                                "${format1(power)} W · ${format1(powerPercent)}%",
-                                style = MaterialTheme.typography.bodyMedium,
-                                modifier = Modifier.padding(top = 6.dp),
-                            )
-                            Text(
-                                "${formatKwh(kwh)} kWh · ${format1(kwhPercent)}%",
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
+                    } else {
+                        val power = measurement.activePowerW.coerceAtLeast(0.0)
+                        val kwh = measurement.energyWh.coerceAtLeast(0.0) / 1000.0
+                        val kwhPercent = if (totalKwh > 0.0) kwh / totalKwh * 100.0 else 0.0
+                        Row(modifier = Modifier.fillMaxWidth().padding(top = 6.dp), verticalAlignment = Alignment.Bottom) {
+                            Text("${formatKwh(kwh)} kWh", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold, fontFamily = com.smartplug.app.ui.theme.SmartPlugMono, modifier = Modifier.weight(1f))
+                            Text("${format1(power)} W", style = MaterialTheme.typography.bodyMedium, fontFamily = com.smartplug.app.ui.theme.SmartPlugMono, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
+                        Spacer(Modifier.height(8.dp))
+                        LinearProgressIndicator(
+                            progress = { (kwhPercent / 100.0).toFloat().coerceIn(0f, 1f) },
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                        Text(
+                            localized(language, "${format1(kwhPercent)}% dari total energi", "${format1(kwhPercent)}% of total energy"),
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(top = 4.dp),
+                        )
                     }
                 }
             }
@@ -127,13 +195,5 @@ fun HomeScreen(
     }
 }
 
-@Composable
-private fun OverviewValue(label: String, value: String, modifier: Modifier = Modifier) {
-    Column(modifier = modifier) {
-        Text(label, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        Text(value, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
-    }
-}
-
 private fun format1(value: Double): String = String.format(Locale.US, "%.1f", value)
-private fun formatKwh(value: Double): String = String.format(Locale.US, "%.5f", value)
+private fun formatKwh(value: Double): String = String.format(Locale.US, "%.3f", value)

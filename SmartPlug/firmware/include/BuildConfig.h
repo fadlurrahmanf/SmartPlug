@@ -28,9 +28,20 @@
 #define SMARTPLUG_ENABLE_MQTT 0
 #endif
 
+// Migration images are intentionally separate from the normal product image.
+// They provide a two-step, CRC-verified transfer of legacy 64 KiB LittleFS
+// energy to the 32 KiB production layout without changing normal operation.
+#ifndef SMARTPLUG_LEGACY_FS_MIGRATION_STAGE
+#define SMARTPLUG_LEGACY_FS_MIGRATION_STAGE 0
+#endif
+
+#ifndef SMARTPLUG_LITTLEFS_32K
+#define SMARTPLUG_LITTLEFS_32K 0
+#endif
+
 // This is the single release identifier shown by the dashboard, API, serial
 // startup report, and upload report.  Bump it for every firmware release.
-#define SMARTPLUG_RELEASE_VERSION "R3.9.2"
+#define SMARTPLUG_RELEASE_VERSION "R3.10.2"
 
 #ifndef SMARTPLUG_STANDBY_THRESHOLD_W
 #define SMARTPLUG_STANDBY_THRESHOLD_W 2.0F
@@ -74,7 +85,11 @@ constexpr unsigned long kRelayPulseMs = SMARTPLUG_RELAY_PULSE_MS;
 constexpr unsigned long kRelayCooldownMs = SMARTPLUG_RELAY_COOLDOWN_MS;
 constexpr bool kLocalApiEnabled = SMARTPLUG_ENABLE_LOCAL_API == 1;
 constexpr bool kMqttEnabled = SMARTPLUG_ENABLE_MQTT == 1;
-#if defined(SMARTPLUG_FACTORY_PROVISIONED)
+#if SMARTPLUG_LEGACY_FS_MIGRATION_STAGE
+constexpr char kFirmwareVersion[] = SMARTPLUG_RELEASE_VERSION "-migrate64";
+#elif SMARTPLUG_LITTLEFS_32K
+constexpr char kFirmwareVersion[] = SMARTPLUG_RELEASE_VERSION "-32k";
+#elif defined(SMARTPLUG_FACTORY_PROVISIONED)
 constexpr char kFirmwareVersion[] = SMARTPLUG_RELEASE_VERSION "-factory";
 #elif defined(SMARTPLUG_RUNTIME_MODE)
 constexpr char kFirmwareVersion[] = SMARTPLUG_RELEASE_VERSION "-unified";

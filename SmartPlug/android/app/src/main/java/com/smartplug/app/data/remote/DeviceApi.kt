@@ -5,13 +5,21 @@ import com.smartplug.app.data.remote.dto.DeviceStatusDto
 import com.smartplug.app.data.remote.dto.DeviceScheduleDto
 import com.smartplug.app.data.remote.dto.RelayCommandRequestDto
 import com.smartplug.app.data.remote.dto.RelayCommandResponseDto
+import com.smartplug.app.data.remote.dto.AccessEnrollRequestDto
+import com.smartplug.app.data.remote.dto.AccessEnrollResponseDto
+import com.smartplug.app.data.remote.dto.AccessInvitationRequestDto
+import com.smartplug.app.data.remote.dto.AccessInvitationResponseDto
+import com.smartplug.app.data.remote.dto.DeviceAccessProfileDto
+import com.smartplug.app.data.remote.dto.AccessCredentialsResponseDto
 import retrofit2.Response
 import retrofit2.http.Body
+import retrofit2.http.DELETE
 import retrofit2.http.FieldMap
 import retrofit2.http.FormUrlEncoded
 import retrofit2.http.GET
 import retrofit2.http.Header
 import retrofit2.http.POST
+import retrofit2.http.Query
 
 /**
  * SmartPlug's operational REST API used once the device has an owner token (design.md
@@ -38,6 +46,13 @@ interface DeviceApi {
     @FormUrlEncoded
     @POST("/api/v1/settings/mqtt")
     suspend fun setMqttSettings(
+        @Header("Authorization") bearerToken: String,
+        @FieldMap values: Map<String, String>,
+    ): Response<Unit>
+
+    @FormUrlEncoded
+    @POST("/api/v1/settings/display-name")
+    suspend fun setDisplayName(
         @Header("Authorization") bearerToken: String,
         @FieldMap values: Map<String, String>,
     ): Response<Unit>
@@ -74,4 +89,33 @@ interface DeviceApi {
         @Header("Authorization") bearerToken: String,
         @FieldMap values: Map<String, String>,
     ): Response<DeviceScheduleDto>
+
+    @GET("/api/v1/access/profile")
+    suspend fun getAccessProfile(
+        @Header("Authorization") bearerToken: String,
+    ): Response<DeviceAccessProfileDto>
+
+    @POST("/api/v1/access/invitations")
+    suspend fun createAccessInvitation(
+        @Header("Authorization") bearerToken: String,
+        @Body request: AccessInvitationRequestDto,
+    ): Response<AccessInvitationResponseDto>
+
+    /** Owner-only list.  The firmware returns credential IDs and roles only, never credentials. */
+    @GET("/api/v1/access/credentials")
+    suspend fun getAccessCredentials(
+        @Header("Authorization") bearerToken: String,
+    ): Response<AccessCredentialsResponseDto>
+
+    /** Owner-only.  Only member credential IDs can be revoked by firmware. */
+    @DELETE("/api/v1/access/credentials")
+    suspend fun revokeAccessCredential(
+        @Header("Authorization") bearerToken: String,
+        @Query("credential_id") credentialId: String,
+    ): Response<Unit>
+
+    @POST("/api/v1/access/enroll")
+    suspend fun enrollAccess(
+        @Body request: AccessEnrollRequestDto,
+    ): Response<AccessEnrollResponseDto>
 }

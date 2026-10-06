@@ -44,11 +44,38 @@ data class DiscoveredSmartPlugAp(
     val apPassword: String get() = "setup-$unitId"
 }
 
+/** A ServerSmartPlug setup access point that is currently advertising nearby. */
+data class DiscoveredServerSetupAp(
+    val ssid: String,
+    val rssi: Int,
+    /** Android may throttle scans after SmartPlug onboarding; this is a known-SSID connection probe. */
+    val isConnectionProbe: Boolean = false,
+)
+
 /** A ServerSmartPlug discovered on the home Wi-Fi during onboarding (`_srvrplug._tcp`). */
 data class DiscoveredServer(
     val serverId: String,
     val host: String,
     val port: Int,
+)
+
+/** A previously paired SmartPlug announced on the home LAN by `_smartplug._tcp`.
+ * It is intentionally distinct from [DiscoveredSmartPlugAp], which is only for
+ * factory-reset Wi-Fi onboarding. */
+data class DiscoveredExistingSmartPlug(
+    val deviceId: String,
+    val host: String,
+)
+
+/** A short-lived code created by the owner phone for enrolling one additional phone. */
+data class MemberInvitation(
+    val code: String,
+    val expiresInSeconds: Long,
+)
+
+/** A revocable additional-phone credential.  Credentials themselves never leave Secure Storage. */
+data class ManagedMember(
+    val credentialId: String,
 )
 
 /** A ServerSmartPlug registered in this app.  Its secret API token stays only in encrypted storage. */
@@ -144,6 +171,12 @@ data class ElectricalMeasurement(
     val energyWh: Double,
 )
 
+/** A status and electrical sample read from the same ServerSmartPlug `/latest` response. */
+data class DeviceSnapshot(
+    val status: DeviceStatus,
+    val measurement: ElectricalMeasurement,
+)
+
 data class DeviceStatus(
     val deviceId: String,
     val relayState: RelayState,
@@ -170,6 +203,8 @@ data class DailyScheduleEntry(
 data class DeviceSchedule(
     val enabled: Boolean,
     val clockSynchronized: Boolean,
+    /** UTC timestamp reported by the schedule authority (SmartPlug or ServerSmartPlug). */
+    val clockUtcMs: Long = 0L,
     val timezoneOffsetMinutes: Int,
     val nextRemainingSeconds: Long,
     val nextTurnOn: Boolean?,

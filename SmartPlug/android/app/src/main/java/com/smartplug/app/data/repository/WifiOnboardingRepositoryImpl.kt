@@ -12,10 +12,13 @@ import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.location.LocationManager
 import android.net.wifi.WifiManager
+import android.net.wifi.ScanResult
 import android.net.wifi.WifiNetworkSpecifier
 import androidx.core.content.ContextCompat
 import androidx.core.location.LocationManagerCompat
 import com.smartplug.app.domain.model.DiscoveredSmartPlugAp
+import com.smartplug.app.domain.model.DiscoveredServerSetupAp
+import com.smartplug.app.domain.model.HomeWifiNetwork
 import com.smartplug.app.domain.repository.WifiOnboardingRepository
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.delay
@@ -28,7 +31,7 @@ import kotlin.coroutines.resume
 /** Access-point SSIDs SmartPlug/ServerSmartPlug advertise before onboarding, design.md
  * "Standar nama discovery". Filters out `SrvrPlug-` too so it never shows as a pairable plug. */
 private const val SMARTPLUG_AP_PREFIX = "SP-"
-private const val SERVER_AP_PREFIX = "SrvrPlug-"
+private const val SERVER_SETUP_AP_SSID = "ServerSmartPlug-Setup"
 
 @Singleton
 class WifiOnboardingRepositoryImpl @Inject constructor(
@@ -60,7 +63,33 @@ class WifiOnboardingRepositoryImpl @Inject constructor(
         return !LocationManagerCompat.isLocationEnabled(locationManager)
     }
 
-    override suspend fun scanForSmartPlugAps(): Result<List<DiscoveredSmartPlugAp>> {
+    override suspend fun scanForSmartPlugAps(): Result<List<DiscoveredSmartPlugAp>> =
+        scanAndRead { readDiscoveredAps() }
+
+    override suspend fun scanForServerSetupAps(): Result<List<DiscoveredServerSetupAp>> {
+        if (!hasRequiredPermission()) return Result.failure(SecurityException("Wi-Fi scan permission not granted"))
+        if (isLocationServiceRequiredAndDisabled()) return Result.failure(IllegalStateException("location_services_disabled"))
+        return try {
+            // Samsung/Android 16 can throttle a second application scan immediately after the
+            // SmartPlug's own AP + home-Wi-Fi scans.  The factory server AP has an immutable
+            // protocol SSID, so after one fresh scan times out we expose it as a *probe*, not as
+            // a false discovery.  The following WifiNetworkSpecifier connection and /setup/status
+            // request still prove that the powered server is actually present.
+            triggerScanAndAwaitResults()
+            val discovered = readDiscoveredServerSetupAps()
+            Result.success(
+                if (discovered.isNotEmpty()) discovered
+                else listOf(DiscoveredServerSetupAp(SERVER_SETUP_AP_SSID, rssi = -100, isConnectionProbe = true)),
+            )
+        } catch (e: SecurityException) {
+            Result.failure(e)
+        }
+    }
+
+    override suspend fun scanNearbyHomeWifi(): Result<List<HomeWifiNetwork>> =
+        scanAndRead { readNearbyHomeWifi() }
+
+    private suspend fun <T> scanAndRead(read: () -> List<T>): Result<List<T>> {
         if (!hasRequiredPermission()) {
             return Result.failure(SecurityException("Wi-Fi scan permission not granted"))
         }
@@ -73,7 +102,7 @@ class WifiOnboardingRepositoryImpl @Inject constructor(
             // user grants permission — an SP-<unit_id> AP that only just started broadcasting
             // would silently never show up. A scan must actually be triggered first.
             triggerScanAndAwaitResults()
-            var discovered = readDiscoveredAps()
+            var discovered = read()
             // Android throttles WifiManager.startScan() aggressively (a handful of calls per app
             // per short window, tighter on newer OS versions) — after a few retries in one
             // onboarding session our own trigger silently stops actually scanning and just
@@ -83,7 +112,7 @@ class WifiOnboardingRepositoryImpl @Inject constructor(
             var attempts = 0
             while (discovered.isEmpty() && attempts < MAX_FALLBACK_POLL_ATTEMPTS) {
                 delay(FALLBACK_POLL_INTERVAL_MS)
-                discovered = readDiscoveredAps()
+                discovered = read()
                 attempts++
             }
             Result.success(discovered)
@@ -93,14 +122,47 @@ class WifiOnboardingRepositoryImpl @Inject constructor(
     }
 
     @Suppress("DEPRECATION")
-    private fun readDiscoveredAps(): List<DiscoveredSmartPlugAp> = wifiManager.scanResults
-        .filter { it.SSID.startsWith(SMARTPLUG_AP_PREFIX) && !it.SSID.startsWith(SERVER_AP_PREFIX) }
+    private fun readScanResults(): List<ScanResult> {
+        // scanResults can throw when the permission is revoked while this screen is open.
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+            return emptyList()
+        }
+        return wifiManager.scanResults
+    }
+
+    private fun readDiscoveredAps(): List<DiscoveredSmartPlugAp> = readScanResults()
+        .filter { it.SSID.startsWith(SMARTPLUG_AP_PREFIX) }
         .distinctBy { it.SSID }
         .map { result ->
             DiscoveredSmartPlugAp(
                 ssid = result.SSID,
                 unitId = result.SSID.removePrefix(SMARTPLUG_AP_PREFIX),
                 rssi = result.level,
+            )
+        }
+        .sortedByDescending { it.rssi }
+
+    private fun readDiscoveredServerSetupAps(): List<DiscoveredServerSetupAp> = readScanResults()
+        .filter { it.SSID == SERVER_SETUP_AP_SSID }
+        .distinctBy { it.BSSID }
+        .map { result -> DiscoveredServerSetupAp(ssid = result.SSID, rssi = result.level) }
+        .sortedByDescending { it.rssi }
+
+    private fun readNearbyHomeWifi(): List<HomeWifiNetwork> = readScanResults()
+        .filter { it.SSID.isNotBlank() }
+        .groupBy { it.SSID }
+        .map { (_, sameSsid) -> sameSsid.maxBy { it.level } }
+        .map { result ->
+            HomeWifiNetwork(
+                ssid = result.SSID,
+                rssi = result.level,
+                // [ESS] only means an infrastructure network; it appears on both open and
+                // WPA/WPA2/WPA3 networks. Treat a network as secured when its scan capability
+                // actually advertises an authentication method.
+                security = if (result.capabilities.contains("WEP") ||
+                    result.capabilities.contains("PSK") ||
+                    result.capabilities.contains("SAE") ||
+                    result.capabilities.contains("EAP")) "secured" else "open",
             )
         }
         .sortedByDescending { it.rssi }
@@ -164,10 +226,14 @@ class WifiOnboardingRepositoryImpl @Inject constructor(
                 }
 
                 override fun onLost(network: Network) {
-                    if (boundNetwork == network) {
-                        connectivityManager.bindProcessToNetwork(null)
-                        boundNetwork = null
-                    }
+                    // Do not implicitly unbind the process here.  On recent Android releases a
+                    // WifiNetworkSpecifier callback can report this transition while the phone
+                    // remains associated with the SmartPlug AP as the ESP switches into AP+STA
+                    // to join the selected home Wi-Fi.  Unbinding at that moment sends the
+                    // mandatory pairing-status poll through mobile/default routing and turns a
+                    // completed device configuration into a false "no_connectivity" failure.
+                    // The onboarding state machine owns the only safe handoff point and calls
+                    // releaseApBinding() explicitly after it receives the terminal status.
                 }
             }
             boundCallback = callback

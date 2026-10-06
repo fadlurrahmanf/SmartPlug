@@ -10,7 +10,7 @@ import javax.inject.Singleton
 
 /**
  * Keystore-backed storage for secrets that must never sit in plain SharedPreferences, log lines,
- * or Room: per-device `owner_token`, the ServerSmartPlug API token, and any home Wi-Fi password
+ * or Room: per-device access credentials (owner or member), the ServerSmartPlug API token, and any home Wi-Fi password
  * the user has asked the app to remember (design.md "Password Wi-Fi rumah").
  *
  * [EncryptedSharedPreferences] wraps a hardware-backed [MasterKey] in the Android Keystore; the
@@ -33,14 +33,56 @@ class SecureTokenStore @Inject constructor(
         )
     }
 
-    fun ownerToken(deviceId: String): String? = prefs.getString(ownerTokenKey(deviceId), null)
+    /**
+     * Returns this phone's credential for one device.  It may be the original owner token or a
+     * separately issued member credential; callers must never infer the role from this value.
+     */
+    fun accessCredential(deviceId: String): String? = prefs.getString(accessCredentialKey(deviceId), null)
+
+    /**
+     * Stores an access credential whose role is not known locally.  This only
+     * exists for migration/legacy callers; server-configuration code must
+     * resolve it before treating it as an owner credential.
+     */
+    fun setAccessCredential(deviceId: String, credential: String) {
+        prefs.edit().putString(accessCredentialKey(deviceId), credential).apply()
+    }
+
+    /** Credentials issued by the additional-phone invitation flow are always members. */
+    fun setMemberCredential(deviceId: String, credential: String) {
+        prefs.edit()
+            .putString(accessCredentialKey(deviceId), credential)
+            .putString(accessRoleKey(deviceId), DeviceAccessRole.MEMBER.storageValue)
+            .apply()
+    }
+
+    fun accessRole(deviceId: String): DeviceAccessRole = when (
+        prefs.getString(accessRoleKey(deviceId), null)
+    ) {
+        DeviceAccessRole.OWNER.storageValue -> DeviceAccessRole.OWNER
+        DeviceAccessRole.MEMBER.storageValue -> DeviceAccessRole.MEMBER
+        else -> DeviceAccessRole.UNKNOWN
+    }
+
+    fun clearAccessCredential(deviceId: String) {
+        prefs.edit()
+            .remove(accessCredentialKey(deviceId))
+            .remove(accessRoleKey(deviceId))
+            .apply()
+    }
+
+    /** Backward-compatible names for the original Direct onboarding path. */
+    fun ownerToken(deviceId: String): String? = accessCredential(deviceId)
 
     fun setOwnerToken(deviceId: String, token: String) {
-        prefs.edit().putString(ownerTokenKey(deviceId), token).apply()
+        prefs.edit()
+            .putString(accessCredentialKey(deviceId), token)
+            .putString(accessRoleKey(deviceId), DeviceAccessRole.OWNER.storageValue)
+            .apply()
     }
 
     fun clearOwnerToken(deviceId: String) {
-        prefs.edit().remove(ownerTokenKey(deviceId)).apply()
+        clearAccessCredential(deviceId)
     }
 
     var serverApiToken: String?
@@ -53,6 +95,10 @@ class SecureTokenStore @Inject constructor(
 
     fun setServerApiToken(serverId: String, token: String) {
         prefs.edit().putString(serverTokenKey(serverId), token).apply()
+    }
+
+    fun clearServerApiToken(serverId: String) {
+        prefs.edit().remove(serverTokenKey(serverId)).apply()
     }
 
     fun serverProfilesJson(): String = prefs.getString(KEY_SERVER_PROFILES, "[]") ?: "[]"
@@ -72,7 +118,10 @@ class SecureTokenStore @Inject constructor(
         prefs.edit().clear().apply()
     }
 
-    private fun ownerTokenKey(deviceId: String) = "owner_token_$deviceId"
+    // Keep the existing encrypted preference key so upgrading the app does not discard an
+    // already-working Direct owner credential.  The semantic API above is role-neutral.
+    private fun accessCredentialKey(deviceId: String) = "owner_token_$deviceId"
+    private fun accessRoleKey(deviceId: String) = "access_role_$deviceId"
     private fun wifiKey(ssid: String) = "wifi_pw_$ssid"
     private fun serverTokenKey(serverId: String) = "server_api_token_$serverId"
 
@@ -80,4 +129,11 @@ class SecureTokenStore @Inject constructor(
         private const val KEY_SERVER_API_TOKEN = "server_api_token"
         private const val KEY_SERVER_PROFILES = "server_profiles"
     }
+}
+
+/** Role metadata is encrypted alongside the credential, never stored in Room. */
+enum class DeviceAccessRole(internal val storageValue: String) {
+    OWNER("owner"),
+    MEMBER("member"),
+    UNKNOWN("unknown"),
 }

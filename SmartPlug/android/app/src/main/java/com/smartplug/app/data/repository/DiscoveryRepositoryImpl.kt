@@ -3,6 +3,9 @@ package com.smartplug.app.data.repository
 import android.content.Context
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
+import android.os.Handler
+import android.os.Looper
+import com.smartplug.app.domain.model.DiscoveredExistingSmartPlug
 import com.smartplug.app.domain.model.DiscoveredServer
 import com.smartplug.app.domain.repository.DiscoveryRepository
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -36,6 +39,15 @@ class DiscoveryRepositoryImpl @Inject constructor(
             val port = resolved.attributes["mqtt_port"]?.let { String(it).toIntOrNull() } ?: resolved.port
             DiscoveredServer(serverId = serverId, host = resolved.host.hostAddress ?: return@withTimeoutOrNull null, port = port)
         }
+
+    override suspend fun discoverExistingDevices(timeoutMs: Long): List<DiscoveredExistingSmartPlug> =
+        discoverServicesForWindow(DEVICE_SERVICE_TYPE, timeoutMs)
+            .mapNotNull { resolved ->
+                val deviceId = resolved.attributes["device_id"]?.let(::String).orEmpty()
+                val host = resolved.host?.hostAddress.orEmpty()
+                if (deviceId.isBlank() || host.isBlank()) null else DiscoveredExistingSmartPlug(deviceId, host)
+            }
+            .distinctBy { it.deviceId }
 
     override suspend fun resolveDeviceLanIp(deviceId: String, timeoutMs: Long): String? =
         withTimeoutOrNull(timeoutMs) {
@@ -102,6 +114,57 @@ class DiscoveryRepositoryImpl @Inject constructor(
             consumerJob.cancel()
             pendingCandidates.close()
             runCatching { nsdManager.stopServiceDiscovery(listener) }
+        }
+    }
+
+    /**
+     * Android NSD discovery has no natural "complete" callback.  For an explicit user scan we
+     * keep a bounded discovery window, resolve every advertised service, then return the unique
+     * resolved results.  Cancellation always stops discovery, so navigating away cannot leave a
+     * listener active in the app process.
+     */
+    private suspend fun discoverServicesForWindow(
+        serviceType: String,
+        timeoutMs: Long,
+    ): List<NsdServiceInfo> = suspendCancellableCoroutine { continuation ->
+        val resolvedByName = linkedMapOf<String, NsdServiceInfo>()
+        val mainHandler = Handler(Looper.getMainLooper())
+        var stopped = false
+        lateinit var listener: NsdManager.DiscoveryListener
+
+        fun stopAndResume() {
+            if (stopped) return
+            stopped = true
+            mainHandler.removeCallbacksAndMessages(null)
+            runCatching { nsdManager.stopServiceDiscovery(listener) }
+            if (continuation.isActive) continuation.resume(resolvedByName.values.toList())
+        }
+
+        listener = object : NsdManager.DiscoveryListener {
+            override fun onDiscoveryStarted(regType: String) = Unit
+            override fun onServiceFound(service: NsdServiceInfo) {
+                nsdManager.resolveService(service, object : NsdManager.ResolveListener {
+                    override fun onResolveFailed(serviceInfo: NsdServiceInfo, errorCode: Int) = Unit
+                    override fun onServiceResolved(serviceInfo: NsdServiceInfo) {
+                        if (!stopped) resolvedByName[serviceInfo.serviceName] = serviceInfo
+                    }
+                })
+            }
+            override fun onServiceLost(service: NsdServiceInfo) {
+                resolvedByName.remove(service.serviceName)
+            }
+            override fun onDiscoveryStopped(serviceType: String) = Unit
+            override fun onStartDiscoveryFailed(serviceType: String, errorCode: Int) = stopAndResume()
+            override fun onStopDiscoveryFailed(serviceType: String, errorCode: Int) = Unit
+        }
+        mainHandler.postDelayed({ stopAndResume() }, timeoutMs.coerceAtLeast(1L))
+        nsdManager.discoverServices(serviceType, NsdManager.PROTOCOL_DNS_SD, listener)
+        continuation.invokeOnCancellation {
+            if (!stopped) {
+                stopped = true
+                mainHandler.removeCallbacksAndMessages(null)
+                runCatching { nsdManager.stopServiceDiscovery(listener) }
+            }
         }
     }
 

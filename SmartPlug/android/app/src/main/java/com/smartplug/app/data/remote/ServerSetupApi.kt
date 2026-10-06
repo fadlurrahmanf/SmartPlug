@@ -16,6 +16,9 @@ interface ServerSetupApi {
     @FormUrlEncoded
     @POST("/setup")
     suspend fun apply(@FieldMap values: Map<String, String>): Response<Unit>
+
+    @POST("/setup/scan-wifi")
+    suspend fun scanWifi(): Response<ServerSetupScanWifiResponseDto>
 }
 
 @JsonClass(generateAdapter = true)
@@ -31,4 +34,16 @@ data class ServerSetupStationDto(
     val configured: Boolean = false,
     val connected: Boolean = false,
     val ip: String = "",
+)
+
+@JsonClass(generateAdapter = true)
+data class ServerSetupScanWifiResponseDto(
+    val networks: List<ServerSetupWifiNetworkDto> = emptyList(),
+)
+
+@JsonClass(generateAdapter = true)
+data class ServerSetupWifiNetworkDto(
+    val ssid: String = "",
+    val rssi: Int = -100,
+    val security: String = "secured",
 )

@@ -15,6 +15,10 @@
          also holds ACCESS_FINE_LOCATION anyway — since onboarding fundamentally depends on
          matching a real "SP-<unit_id>" SSID, that shortcut doesn't apply here; fine location is
          requested on all API levels instead. -->
+    <!-- Android 12+ requires the coarse declaration whenever fine location is
+         requested; the runtime flow continues to request fine location for
+         real SSID visibility during onboarding. -->
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
 
     <!-- mDNS/NSD re-discovery of the device or ServerSmartPlug on the home LAN -->
@@ -29,6 +33,7 @@
     <application
         android:name=".SmartPlugApplication"
         android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
         android:fullBackupContent="false"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"

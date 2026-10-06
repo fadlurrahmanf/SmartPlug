@@ -7,9 +7,13 @@ import com.smartplug.app.data.remote.safeApiCall
 import com.smartplug.app.data.remote.map
 import com.smartplug.app.domain.model.ApiFailure
 import com.smartplug.app.domain.model.IntegrationMode
+import com.smartplug.app.domain.model.MemberInvitation
+import com.smartplug.app.domain.model.ManagedMember
 import com.smartplug.app.domain.model.DeviceSchedule
 import com.smartplug.app.domain.model.DailyScheduleEntry
 import com.smartplug.app.domain.model.SmartPlugDevice
+import com.smartplug.app.data.remote.dto.ServerScheduleRequestDto
+import com.smartplug.app.data.remote.dto.ServerTimerRequestDto
 import com.smartplug.app.domain.repository.DeviceControlRepository
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -21,6 +25,53 @@ class DeviceControlRepositoryImpl @Inject constructor(
     private val apiClientFactory: ApiClientFactory,
 ) : DeviceControlRepository {
 
+    override suspend fun setSharedDisplayName(device: SmartPlugDevice, displayName: String): ApiResult<Unit> {
+        val normalized = displayName.trim()
+        if (normalized.isEmpty() || normalized.length > 32) {
+            return ApiResult.Failure(ApiFailure(400, "invalid_display_name"))
+        }
+        // This is device-scoped owner metadata even in Server mode. Do not
+        // transmit it through ServerSmartPlug or require a server API token.
+        return direct(device) { api, bearer ->
+            api.setDisplayName(bearer, mapOf("display_name" to normalized))
+        }
+    }
+
+    override suspend fun createMemberInvitation(device: SmartPlugDevice): ApiResult<MemberInvitation> {
+        // Invitation creation intentionally goes to the local SmartPlug even in Server mode:
+        // the owner credential is device-scoped, never copied to ServerSmartPlug.
+        val ip = device.lanIp ?: return ApiResult.Failure(ApiFailure(0, "missing_lan_ip"))
+        val bearer = tokenStore.accessCredential(device.deviceId)?.let { "Bearer $it" }
+            ?: return ApiResult.Failure(ApiFailure(0, "missing_owner_token"))
+        return safeApiCall {
+            apiClientFactory.deviceApi(ApiClientFactory.lanBaseUrl(ip))
+                .createAccessInvitation(bearer, com.smartplug.app.data.remote.dto.AccessInvitationRequestDto())
+        }.map { MemberInvitation(it.inviteCode, it.expiresInSeconds) }
+    }
+
+    override suspend fun listManagedMembers(device: SmartPlugDevice): ApiResult<List<ManagedMember>> {
+        val ip = device.lanIp ?: return ApiResult.Failure(ApiFailure(0, "missing_lan_ip"))
+        val bearer = tokenStore.accessCredential(device.deviceId)?.let { "Bearer $it" }
+            ?: return ApiResult.Failure(ApiFailure(0, "missing_owner_token"))
+        return safeApiCall {
+            apiClientFactory.deviceApi(ApiClientFactory.lanBaseUrl(ip)).getAccessCredentials(bearer)
+        }.map { response ->
+            // Defense in depth: owner is never rendered as a revocable entry even if a future
+            // firmware response accidentally includes it.
+            response.credentials.filter { it.role == "member" }.map { ManagedMember(it.credentialId) }
+        }
+    }
+
+    override suspend fun revokeManagedMember(device: SmartPlugDevice, credentialId: String): ApiResult<Unit> {
+        if (credentialId.isBlank()) return ApiResult.Failure(ApiFailure(400, "invalid_credential_id"))
+        val ip = device.lanIp ?: return ApiResult.Failure(ApiFailure(0, "missing_lan_ip"))
+        val bearer = tokenStore.accessCredential(device.deviceId)?.let { "Bearer $it" }
+            ?: return ApiResult.Failure(ApiFailure(0, "missing_owner_token"))
+        return safeApiCall {
+            apiClientFactory.deviceApi(ApiClientFactory.lanBaseUrl(ip)).revokeAccessCredential(bearer, credentialId)
+        }
+    }
+
     override suspend fun resetEnergy(device: SmartPlugDevice): ApiResult<Unit> = when (device.integrationMode) {
         IntegrationMode.DIRECT -> direct(device) { api, bearer -> api.resetEnergy(bearer, energyConfirmation()) }
         IntegrationMode.SERVER -> server(device) { api, bearer -> api.resetEnergy(bearer, device.deviceId, energyConfirmation()) }
@@ -29,6 +80,21 @@ class DeviceControlRepositoryImpl @Inject constructor(
     override suspend fun factoryReset(device: SmartPlugDevice): ApiResult<Unit> = when (device.integrationMode) {
         IntegrationMode.DIRECT -> direct(device) { api, bearer -> api.factoryReset(bearer, factoryConfirmation()) }
         IntegrationMode.SERVER -> server(device) { api, bearer -> api.factoryReset(bearer, device.deviceId, factoryConfirmation()) }
+    }
+
+    override suspend fun factoryResetForGlobalReset(device: SmartPlugDevice): ApiResult<Unit> {
+        // The server endpoint returns once a reset command is queued. That is the
+        // correct asynchronous behaviour for remote control, but a global reset
+        // must not reset its broker before the local SmartPlug has received the
+        // command. Prefer the directly acknowledged local endpoint first.
+        val local = direct(device) { api, bearer -> api.factoryReset(bearer, factoryConfirmation()) }
+        if (local is ApiResult.Success) return local
+        return when (device.integrationMode) {
+            IntegrationMode.DIRECT -> local
+            IntegrationMode.SERVER -> server(device) { api, bearer ->
+                api.factoryReset(bearer, device.deviceId, factoryConfirmation())
+            }
+        }
     }
 
     override suspend fun applyTimer(
@@ -50,7 +116,9 @@ class DeviceControlRepositoryImpl @Inject constructor(
 
     override suspend fun resetTimer(device: SmartPlugDevice): ApiResult<Unit> = when (device.integrationMode) {
         IntegrationMode.DIRECT -> direct(device) { api, bearer -> api.setTimer(bearer, mapOf("action" to "reset")) }
-        IntegrationMode.SERVER -> server(device) { api, bearer -> api.setTimer(bearer, device.deviceId, mapOf("action" to "reset")) }
+        IntegrationMode.SERVER -> server(device) { api, bearer ->
+            api.setTimer(bearer, device.deviceId, ServerTimerRequestDto(action = "reset"))
+        }
     }
 
     override suspend fun getSchedule(device: SmartPlugDevice): ApiResult<DeviceSchedule> = when (device.integrationMode) {
@@ -62,7 +130,11 @@ class DeviceControlRepositoryImpl @Inject constructor(
         device: SmartPlugDevice, enabled: Boolean, timezoneOffsetMinutes: Int,
     ): ApiResult<DeviceSchedule> = when (device.integrationMode) {
         IntegrationMode.DIRECT -> scheduleDirect(device) { api, bearer -> api.setSchedule(bearer, scheduleForm("set_enabled", timezoneOffsetMinutes) + mapOf("enabled" to enabled.toString())) }
-        IntegrationMode.SERVER -> scheduleServer(device) { api, bearer -> api.setSchedule(bearer, device.deviceId, scheduleBody("set_enabled", timezoneOffsetMinutes) + mapOf("enabled" to enabled)) }
+        IntegrationMode.SERVER -> scheduleServer(device) { api, bearer ->
+            api.setSchedule(bearer, device.deviceId, ServerScheduleRequestDto(
+                action = "set_enabled", timezoneOffsetMinutes = timezoneOffsetMinutes.coerceIn(-720, 840), enabled = enabled,
+            ))
+        }
     }
 
     override suspend fun addSchedule(
@@ -75,7 +147,14 @@ class DeviceControlRepositoryImpl @Inject constructor(
                 api.setSchedule(bearer, scheduleForm("add", timezoneOffsetMinutes) + mapOf("hour" to hour.toString(), "minute" to minute.toString(), "state" to if (turnOn) "on" else "off", "event" to normalizedEvent))
             }
             IntegrationMode.SERVER -> scheduleServer(device) { api, bearer ->
-                api.setSchedule(bearer, device.deviceId, scheduleBody("add", timezoneOffsetMinutes) + mapOf("hour" to hour, "minute" to minute, "state" to if (turnOn) "on" else "off", "event" to normalizedEvent))
+                api.setSchedule(bearer, device.deviceId, ServerScheduleRequestDto(
+                    action = "add",
+                    timezoneOffsetMinutes = timezoneOffsetMinutes.coerceIn(-720, 840),
+                    hour = hour,
+                    minute = minute,
+                    state = if (turnOn) "on" else "off",
+                    event = normalizedEvent,
+                ))
             }
         }
     }
@@ -83,13 +162,17 @@ class DeviceControlRepositoryImpl @Inject constructor(
     override suspend fun deleteSchedule(device: SmartPlugDevice, index: Int): ApiResult<DeviceSchedule> =
         when (device.integrationMode) {
             IntegrationMode.DIRECT -> scheduleDirect(device) { api, bearer -> api.setSchedule(bearer, mapOf("action" to "delete", "index" to index.toString())) }
-            IntegrationMode.SERVER -> scheduleServer(device) { api, bearer -> api.setSchedule(bearer, device.deviceId, mapOf("action" to "delete", "index" to index)) }
+            IntegrationMode.SERVER -> scheduleServer(device) { api, bearer ->
+                api.setSchedule(bearer, device.deviceId, ServerScheduleRequestDto(action = "delete", index = index))
+            }
         }
 
     override suspend fun moveSchedule(device: SmartPlugDevice, from: Int, to: Int): ApiResult<DeviceSchedule> =
         when (device.integrationMode) {
             IntegrationMode.DIRECT -> scheduleDirect(device) { api, bearer -> api.setSchedule(bearer, mapOf("action" to "move", "from" to from.toString(), "to" to to.toString())) }
-            IntegrationMode.SERVER -> scheduleServer(device) { api, bearer -> api.setSchedule(bearer, device.deviceId, mapOf("action" to "move", "from" to from, "to" to to)) }
+            IntegrationMode.SERVER -> scheduleServer(device) { api, bearer ->
+                api.setSchedule(bearer, device.deviceId, ServerScheduleRequestDto(action = "move", from = from, to = to))
+            }
         }
 
     private suspend fun direct(
@@ -144,22 +227,18 @@ class DeviceControlRepositoryImpl @Inject constructor(
         "action" to action, "days" to days.toString(), "hours" to hours.toString(),
         "minutes" to minutes.toString(), "seconds" to seconds.toString(),
     )
-    private fun timerBody(action: String, days: Int = 0, hours: Int = 0, minutes: Int = 0, seconds: Int = 0): Map<String, Any> = mapOf(
-        "action" to action, "days" to days, "hours" to hours, "minutes" to minutes, "seconds" to seconds,
-    )
+    private fun timerBody(action: String, days: Int = 0, hours: Int = 0, minutes: Int = 0, seconds: Int = 0) =
+        ServerTimerRequestDto(action = action, days = days, hours = hours, minutes = minutes, seconds = seconds)
     private fun scheduleForm(action: String, timezoneOffsetMinutes: Int): Map<String, String> = mapOf(
         "action" to action,
         "timezone_offset_minutes" to timezoneOffsetMinutes.coerceIn(-720, 840).toString(),
-    )
-    private fun scheduleBody(action: String, timezoneOffsetMinutes: Int): Map<String, Any> = mapOf(
-        "action" to action,
-        "timezone_offset_minutes" to timezoneOffsetMinutes.coerceIn(-720, 840),
     )
 }
 
 private fun com.smartplug.app.data.remote.dto.DeviceScheduleDto.toSchedule() = DeviceSchedule(
     enabled = enabled,
     clockSynchronized = clock.synchronized,
+    clockUtcMs = clock.utcMs,
     timezoneOffsetMinutes = clock.timezoneOffsetMinutes,
     nextRemainingSeconds = next.remainingSeconds,
     nextTurnOn = when (next.state) { "on" -> true; "off" -> false; else -> null },

@@ -13,8 +13,8 @@ android {
         applicationId = "com.smartplug.app"
         minSdk = 29
         targetSdk = 34
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 69
+        versionName = "0.1.68"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables { useSupportLibrary = true }
@@ -26,25 +26,9 @@ android {
             applicationIdSuffix = ".debug"
         }
         release {
-            // This locally signed handoff is intentionally not minified: the bundled Tink
-            // dependency has unresolved optional Error Prone annotations under R8. Keeping the
-            // bytecode intact avoids an installer artifact that differs from the verified debug
-            // build while a dedicated production signing/release pipeline is not configured.
-            isMinifyEnabled = false
-            isShrinkResources = false
-            // This project has no private release keystore in the workspace.  Sign the
-            // installable handoff artifact with the local debug key rather than emitting an
-            // unsigned release APK; this enables the broad v1/v2/v3 installer compatibility.
-            signingConfig = signingConfigs.getByName("debug")
+            isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-        }
-    }
-
-    signingConfigs {
-        getByName("debug") {
-            enableV1Signing = true
-            enableV2Signing = true
-            enableV3Signing = true
         }
     }
 
@@ -58,7 +42,6 @@ android {
         freeCompilerArgs = freeCompilerArgs + listOf(
             "-opt-in=kotlin.RequiresOptIn",
             "-opt-in=androidx.compose.material3.ExperimentalMaterial3Api",
-            "-opt-in=androidx.compose.material.ExperimentalMaterialApi",
             "-opt-in=androidx.compose.animation.ExperimentalAnimationApi",
         )
     }
@@ -115,6 +98,9 @@ dependencies {
     implementation("com.squareup.retrofit2:retrofit:2.11.0")
     implementation("com.squareup.retrofit2:converter-moshi:2.11.0")
     implementation("com.squareup.moshi:moshi-kotlin:1.15.1")
+    // `@JsonClass(generateAdapter = true)` is used by ServerSmartPlug request/response DTOs.
+    // Keep the official code generator present so Retrofit can construct their converters at runtime.
+    kapt("com.squareup.moshi:moshi-kotlin-codegen:1.15.1")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("com.squareup.okhttp3:logging-interceptor:4.12.0")
 

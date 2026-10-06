@@ -11,7 +11,7 @@
   MQTT berhenti mengirim ulang sampel yang sudah stale.
 - Admin bootstrap wajib diganti sebelum mutasi konfigurasi/relay. Profil
   `esp07_factory` memakai label/kartu kredensial unik dan terikat STA MAC.
-  Build `esp07_product`/`esp07_rest` adalah kompatibilitas unit lama, bukan
+  Build `smartplug_product`/`esp07_rest` adalah kompatibilitas unit lama, bukan
   provisioning unik otomatis untuk setiap unit kosong.
 - API pengaturan MQTT GET diperbaiki: tanda kutip `mode` kini lengkap sehingga
   JSON dapat dibaca. Password kosong saat mengedit broker mempertahankan

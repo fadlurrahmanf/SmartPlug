@@ -5,6 +5,7 @@
 !/README.md
 !/SmartPlug/
 !/ServerSmartPlug/
+!/internal-records/
 
 # Android local state and generated packages.
 /SmartPlug/android/.android-sdk/

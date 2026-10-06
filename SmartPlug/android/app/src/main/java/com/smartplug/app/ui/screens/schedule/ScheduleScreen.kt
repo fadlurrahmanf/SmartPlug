@@ -1,5 +1,11 @@
 package com.smartplug.app.ui.screens.schedule
 
+import com.smartplug.app.ui.theme.AccentGreen
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.material.icons.filled.CalendarMonth
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -9,10 +15,8 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowBack
-import androidx.compose.material.icons.filled.ArrowDownward
-import androidx.compose.material.icons.filled.ArrowUpward
 import androidx.compose.material.icons.filled.Delete
-import androidx.compose.material3.AlertDialog
+import com.smartplug.app.ui.components.SheetDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
@@ -25,6 +29,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import com.smartplug.app.ui.components.ScheduleRail
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
@@ -33,14 +38,18 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.compositeOver
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.smartplug.app.domain.model.DailyScheduleEntry
 import com.smartplug.app.ui.components.SmartPlugCard
+import com.smartplug.app.ui.components.shouldShowScheduleCountdown
 import com.smartplug.app.ui.localization.LocalAppLanguage
 import com.smartplug.app.ui.localization.localized
 import kotlinx.coroutines.delay
+import java.time.Instant
+import java.time.ZoneOffset
 import java.util.TimeZone
 
 @Composable
@@ -58,6 +67,10 @@ fun ScheduleScreen(
     LaunchedEffect(Unit) { while (true) { delay(10_000); viewModel.refresh() } }
     val timezoneOffset = TimeZone.getDefault().getOffset(nowMs) / 60_000
     val schedule = uiState.schedule
+    // Use the exact timezone that will be sent with the Add action. A newly
+    // configured SmartPlug may still report UTC (offset 0), while the first
+    // added entry will atomically establish the user's local schedule offset.
+    val addDefaultTime = schedule?.let { scheduleEntryDefaultTime(it, timezoneOffset, nowMs) }
 
     Scaffold(
         topBar = {
@@ -86,8 +99,17 @@ fun ScheduleScreen(
                         }
                         Switch(checked = value.enabled, onCheckedChange = { viewModel.setEnabled(it, timezoneOffset) })
                     }
-                    if (value.enabled && value.nextTurnOn != null) {
-                        val seconds = (value.nextRemainingSeconds - (nowMs - uiState.scheduleReceivedAtMs).coerceAtLeast(0) / 1_000L).coerceAtLeast(0)
+                    val nowLocal = Instant.ofEpochMilli(nowMs)
+                        .atOffset(ZoneOffset.ofTotalSeconds((if (value.timezoneOffsetMinutes != 0) value.timezoneOffsetMinutes else timezoneOffset).coerceIn(-720, 840) * 60))
+                    ScheduleRail(
+                        entries = value.entries,
+                        nowMinute = nowLocal.hour * 60 + nowLocal.minute,
+                        modifier = Modifier.padding(top = 12.dp),
+                    )
+                    val remainingMs = (value.nextRemainingSeconds * 1_000L -
+                        (nowMs - uiState.scheduleReceivedAtMs).coerceAtLeast(0L)).coerceAtLeast(0L)
+                    if (value.enabled && value.nextTurnOn != null && shouldShowScheduleCountdown(remainingMs)) {
+                        val seconds = remainingMs / 1_000L
                         Text(
                             localized(language, "Berikutnya: ${if (value.nextTurnOn) "ON" else "OFF"} dalam ${formatCountdown(seconds)}", "Next: ${if (value.nextTurnOn) "ON" else "OFF"} in ${formatCountdown(seconds)}"),
                             modifier = Modifier.padding(top = 8.dp),
@@ -96,18 +118,25 @@ fun ScheduleScreen(
                         )
                     }
                 }
-                value.entries.forEachIndexed { index, entry ->
+                // The schedule is a daily timeline, not a manually-ranked list.
+                // Retain the device index for Delete while always rendering
+                // 00:00 through 23:59 to the user.
+                val nextRemainingMs = (value.nextRemainingSeconds * 1_000L -
+                    (nowMs - uiState.scheduleReceivedAtMs).coerceAtLeast(0L)).coerceAtLeast(0L)
+                val nextIndex = nextEntryIndex(value, nowMs + nextRemainingMs)
+                orderedScheduleEntries(value.entries).forEach { indexedEntry ->
                     ScheduleEntryCard(
-                        entry = entry,
-                        canMoveUp = index > 0,
-                        canMoveDown = index < value.entries.lastIndex,
-                        onMoveUp = { viewModel.move(index, index - 1) },
-                        onMoveDown = { viewModel.move(index, index + 1) },
-                        onDelete = { viewModel.delete(index) },
+                        entry = indexedEntry.value,
+                        isNext = indexedEntry.index == nextIndex,
+                        onDelete = { viewModel.delete(indexedEntry.index) },
                     )
                 }
                 if (value.entries.isEmpty()) {
-                    Text(localized(language, "Belum ada jadwal. Tekan + untuk menambahkan ON/OFF harian.", "No schedules yet. Tap + to add a daily ON/OFF action."), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Column(modifier = Modifier.fillMaxWidth().padding(top = 32.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                        Icon(Icons.Filled.CalendarMonth, contentDescription = null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(48.dp))
+                        Text(localized(language, "Belum ada jadwal", "No schedules yet"), style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(top = 12.dp))
+                        Text(localized(language, "Tekan + untuk ON/OFF harian", "Tap + to add a daily ON/OFF action"), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
                 }
             } ?: Text(if (uiState.isLoading) localized(language, "Memuat jadwal…", "Loading schedule…") else scheduleError(language, uiState.error))
             uiState.error?.takeIf { schedule != null }?.let { Text(scheduleError(language, it), color = MaterialTheme.colorScheme.error) }
@@ -115,6 +144,8 @@ fun ScheduleScreen(
     }
     if (showAdd) {
         AddScheduleDialog(
+            initialHour = addDefaultTime?.hour ?: 0,
+            initialMinute = addDefaultTime?.minute ?: 0,
             onDismiss = { showAdd = false },
             onAdd = { hour, minute, turnOn, event ->
                 viewModel.add(hour, minute, turnOn, event, timezoneOffset) { showAdd = false }
@@ -124,34 +155,67 @@ fun ScheduleScreen(
 }
 
 @Composable
-private fun ScheduleEntryCard(entry: DailyScheduleEntry, canMoveUp: Boolean, canMoveDown: Boolean, onMoveUp: () -> Unit, onMoveDown: () -> Unit, onDelete: () -> Unit) {
+private fun ScheduleEntryCard(entry: DailyScheduleEntry, isNext: Boolean, onDelete: () -> Unit) {
     val language = LocalAppLanguage.current
-    SmartPlugCard {
+    SmartPlugCard(
+        highlighted = isNext,
+        containerColor = if (isNext) MaterialTheme.colorScheme.primary.copy(alpha = 0.16f).compositeOver(MaterialTheme.colorScheme.surface) else null,
+    ) {
         Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-            Column(modifier = Modifier.weight(1f)) {
-                Text(if (entry.turnOn) "ON" else "OFF", style = MaterialTheme.typography.titleMedium)
-                Text(localized(language, "Setiap hari ${"%02d:%02d".format(entry.hour, entry.minute)}", "Every day at ${"%02d:%02d".format(entry.hour, entry.minute)}"), style = MaterialTheme.typography.bodyMedium)
-                if (entry.event.isNotBlank()) Text(entry.event, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(
+                "%02d:%02d".format(entry.hour, entry.minute),
+                style = MaterialTheme.typography.headlineSmall,
+                fontWeight = FontWeight.SemiBold,
+                fontFamily = com.smartplug.app.ui.theme.SmartPlugMono,
+            )
+            Spacer(Modifier.width(12.dp))
+            androidx.compose.material3.Surface(
+                shape = androidx.compose.foundation.shape.RoundedCornerShape(50),
+                color = if (entry.turnOn) AccentGreen.copy(alpha = 0.18f) else MaterialTheme.colorScheme.surfaceVariant,
+            ) {
+                Text(
+                    if (entry.turnOn) "ON" else "OFF",
+                    style = MaterialTheme.typography.labelLarge,
+                    fontWeight = FontWeight.Bold,
+                    color = if (entry.turnOn) AccentGreen else MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
+                )
             }
-            IconButton(onClick = onMoveUp, enabled = canMoveUp) { Icon(Icons.Filled.ArrowUpward, "Move up") }
-            IconButton(onClick = onMoveDown, enabled = canMoveDown) { Icon(Icons.Filled.ArrowDownward, "Move down") }
+            Column(modifier = Modifier.weight(1f).padding(start = 12.dp)) {
+                if (entry.event.isNotBlank()) Text(entry.event, style = MaterialTheme.typography.bodyMedium)
+                if (isNext) {
+                    Text(
+                        localized(language, "Berikutnya", "Up next"),
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                }
+            }
             IconButton(onClick = onDelete) { Icon(Icons.Filled.Delete, "Delete") }
         }
     }
 }
 
 @Composable
-private fun AddScheduleDialog(onDismiss: () -> Unit, onAdd: (Int, Int, Boolean, String) -> Unit) {
+private fun AddScheduleDialog(
+    initialHour: Int,
+    initialMinute: Int,
+    onDismiss: () -> Unit,
+    onAdd: (Int, Int, Boolean, String) -> Unit,
+) {
     val language = LocalAppLanguage.current
-    var hour by remember { mutableStateOf("00") }
-    var minute by remember { mutableStateOf("00") }
+    // A schedule is evaluated by SmartPlug/ServerSmartPlug time, not by the
+    // time when this composable happened to be first created.  Seed the form
+    // from that authority so a new entry does not misleadingly start at 00:00.
+    var hour by remember(initialHour) { mutableStateOf("%02d".format(initialHour)) }
+    var minute by remember(initialMinute) { mutableStateOf("%02d".format(initialMinute)) }
     var turnOn by remember { mutableStateOf(true) }
     var event by remember { mutableStateOf("") }
     val valid = hour.toIntOrNull() in 0..23 && minute.toIntOrNull() in 0..59
     val eventValid = event.length <= 24 && event.all { character ->
         character.code in 0x20..0x7e && character !in setOf(',', ':', '"', '\\')
     }
-    AlertDialog(
+    SheetDialog(
         onDismissRequest = onDismiss,
         title = { Text(localized(language, "Tambah jadwal", "Add schedule")) },
         text = {
@@ -180,6 +244,55 @@ private fun AddScheduleDialog(onDismiss: () -> Unit, onAdd: (Int, Int, Boolean, 
         dismissButton = { TextButton(onClick = onDismiss) { Text(localized(language, "Batal", "Cancel")) } },
     )
 }
+
+/** Default an added schedule to the active schedule authority clock.
+ *
+ * `clockUtcMs` is supplied by the SmartPlug/ServerSmartPlug API. If it is not
+ * available yet (for example NTP is still acquiring time), use the current
+ * wall clock expressed in the same schedule timezone rather than silently
+ * returning 00:00. The value is only a form default; it does not write any
+ * device configuration until the user presses Add.
+ */
+internal fun scheduleEntryDefaultTime(
+    schedule: com.smartplug.app.domain.model.DeviceSchedule,
+    displayTimezoneOffsetMinutes: Int,
+    fallbackUtcMs: Long,
+): ScheduleEntryTime {
+    val utcMs = schedule.clockUtcMs.takeIf { it > 0L } ?: fallbackUtcMs
+    val offsetSeconds = displayTimezoneOffsetMinutes.coerceIn(-720, 840) * 60
+    val local = Instant.ofEpochMilli(utcMs).atOffset(ZoneOffset.ofTotalSeconds(offsetSeconds))
+    return ScheduleEntryTime(hour = local.hour, minute = local.minute)
+}
+
+internal data class ScheduleEntryTime(val hour: Int, val minute: Int)
+
+/**
+ * Index (in device order) of the entry that fires at [targetUtcMs]: the one with the reported next
+ * action whose daily time is within a minute of the target, seen in the schedule's own timezone.
+ */
+internal fun nextEntryIndex(schedule: com.smartplug.app.domain.model.DeviceSchedule, targetUtcMs: Long): Int? {
+    val turnOn = schedule.nextTurnOn ?: return null
+    if (!schedule.enabled) return null
+    val offset = ZoneOffset.ofTotalSeconds(schedule.timezoneOffsetMinutes.coerceIn(-720, 840) * 60)
+    val target = Instant.ofEpochMilli(targetUtcMs).atOffset(offset)
+    val targetMinute = target.hour * 60 + target.minute
+    val best = schedule.entries.withIndex()
+        .filter { it.value.turnOn == turnOn }
+        .map { indexed ->
+            val diff = kotlin.math.abs(indexed.value.hour * 60 + indexed.value.minute - targetMinute)
+            indexed.index to minOf(diff, 1440 - diff)
+        }
+        .minByOrNull { it.second }
+    return best?.takeIf { it.second <= 1 }?.first
+}
+
+/** Ascending daily-time display while retaining the original device index for mutations. */
+internal fun orderedScheduleEntries(entries: List<DailyScheduleEntry>): List<IndexedValue<DailyScheduleEntry>> =
+    entries.withIndex().sortedWith(
+        compareBy<IndexedValue<DailyScheduleEntry>> { it.value.hour }
+            .thenBy { it.value.minute }
+            .thenBy { it.index },
+    )
 
 private fun formatCountdown(seconds: Long): String = "%02d:%02d".format(seconds / 60, seconds % 60)
 

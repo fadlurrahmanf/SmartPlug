@@ -20,6 +20,10 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
@@ -80,12 +84,26 @@ fun EnergyHistoryScreen(
                     )
                     else -> {
                         HistorySummary(points = uiState.points, languageEnglish = language.name == "ENGLISH")
-                        HistoryMetricCard(localized(language, "Tegangan (V)", "Voltage (V)"), uiState.points, "V") { it.voltageV }
-                        HistoryMetricCard(localized(language, "Arus (A)", "Current (A)"), uiState.points, "A") { it.currentA }
-                        HistoryMetricCard(localized(language, "Daya aktif (W)", "Active power (W)"), uiState.points, "W") { it.activePowerW }
-                        HistoryMetricCard(localized(language, "Daya semu (VA)", "Apparent power (VA)"), uiState.points, "VA") { it.apparentPowerVa }
-                        HistoryMetricCard(localized(language, "Power factor (%)", "Power factor (%)"), uiState.points, "%") { it.powerFactor * 100.0 }
-                        HistoryMetricCard(localized(language, "Energi kumulatif (kWh)", "Cumulative energy (kWh)"), uiState.points, "kWh") { it.energyWh.coerceAtLeast(0.0) / 1000.0 }
+                        // One chart at a time, chosen with chips: energy first, then power and the rest.
+                        val metrics = listOf<HistoryMetric>(
+                            HistoryMetric(localized(language, "Energi", "Energy"), localized(language, "Energi kumulatif (kWh)", "Cumulative energy (kWh)"), "kWh") { it.energyWh.coerceAtLeast(0.0) / 1000.0 },
+                            HistoryMetric(localized(language, "Daya", "Power"), localized(language, "Daya aktif (W)", "Active power (W)"), "W") { it.activePowerW },
+                            HistoryMetric(localized(language, "Tegangan", "Voltage"), localized(language, "Tegangan (V)", "Voltage (V)"), "V") { it.voltageV },
+                            HistoryMetric(localized(language, "Arus", "Current"), localized(language, "Arus (A)", "Current (A)"), "A") { it.currentA },
+                            HistoryMetric(localized(language, "Daya semu", "Apparent"), localized(language, "Daya semu (VA)", "Apparent power (VA)"), "VA") { it.apparentPowerVa },
+                            HistoryMetric("PF", localized(language, "Power factor (%)", "Power factor (%)"), "%") { it.powerFactor * 100.0 },
+                        )
+                        var selectedMetric by rememberSaveable { mutableIntStateOf(0) }
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(top = 12.dp).horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            metrics.forEachIndexed { index, metric ->
+                                FilterChip(selected = selectedMetric == index, onClick = { selectedMetric = index }, label = { Text(metric.chip) })
+                            }
+                        }
+                        val chosen = metrics[selectedMetric.coerceIn(0, metrics.lastIndex)]
+                        HistoryMetricCard(chosen.title, uiState.points, chosen.unit, chosen.value)
                     }
                 }
             }
@@ -110,13 +128,42 @@ private fun HistoryMetricCard(
 private fun HistorySummary(points: List<EnergyHistoryPoint>, languageEnglish: Boolean) {
     val energyUsedKwh = ((points.last().energyWh - points.first().energyWh) / 1000.0).coerceAtLeast(0.0)
     SmartPlugCard {
-        Text(if (languageEnglish) "Summary" else "Ringkasan", style = MaterialTheme.typography.titleMedium)
         Text(
-            if (languageEnglish) "${points.size} recorded point(s) · ${formatHistory(energyUsedKwh)} kWh used in this range"
-            else "${points.size} titik tercatat · ${formatHistory(energyUsedKwh)} kWh terpakai pada rentang ini",
-            style = MaterialTheme.typography.bodyMedium,
-            modifier = Modifier.padding(top = 4.dp),
+            if (languageEnglish) "Used in this range" else "Terpakai pada rentang ini",
+            style = MaterialTheme.typography.labelLarge,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
+        Row(verticalAlignment = androidx.compose.ui.Alignment.Bottom, modifier = Modifier.padding(top = 4.dp)) {
+            com.smartplug.app.ui.components.AnimatedDecimal(
+                value = energyUsedKwh,
+                decimals = 3,
+                style = MaterialTheme.typography.displaySmall,
+                fontWeight = androidx.compose.ui.text.font.FontWeight.Bold,
+            )
+            Text(" kWh", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary, modifier = Modifier.padding(bottom = 6.dp))
+        }
+        Text(
+            if (languageEnglish) "${points.size} recorded point(s)" else "${points.size} titik tercatat",
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(bottom = 4.dp),
+        )
+        val (barValues, barLabels) = remember(points) { energyBuckets(points) }
+        if (barValues.any { it > 0.0 }) {
+            com.smartplug.app.ui.components.GrowingBars(
+                values = barValues,
+                labels = barLabels,
+                color = MaterialTheme.colorScheme.primary,
+                highlightIndex = barValues.indexOf(barValues.max()),
+                modifier = Modifier.padding(vertical = 8.dp),
+            )
+        }
+        Row(modifier = Modifier.fillMaxWidth().padding(top = 8.dp)) {
+            Text("", modifier = Modifier.weight(1.5f))
+            listOf("Min", if (languageEnglish) "Avg" else "Rata", if (languageEnglish) "Max" else "Maks").forEach {
+                Text(it, modifier = Modifier.weight(1f), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = androidx.compose.ui.text.style.TextAlign.End)
+            }
+        }
         HistoryRangeRow(if (languageEnglish) "Voltage" else "Tegangan", points.map { it.voltageV }, "V")
         HistoryRangeRow(if (languageEnglish) "Current" else "Arus", points.map { it.currentA }, "A")
         HistoryRangeRow(if (languageEnglish) "Active power" else "Daya aktif", points.map { it.activePowerW }, "W")
@@ -127,14 +174,44 @@ private fun HistorySummary(points: List<EnergyHistoryPoint>, languageEnglish: Bo
 @Composable
 private fun HistoryRangeRow(label: String, values: List<Double>, unit: String) {
     if (values.isEmpty()) return
-    Row(modifier = Modifier.fillMaxWidth().padding(top = 5.dp)) {
-        Text(label, modifier = Modifier.weight(1f), style = MaterialTheme.typography.labelMedium)
-        Text(
-            "${formatHistory(values.min())} / ${formatHistory(values.average())} / ${formatHistory(values.max())} $unit",
-            style = MaterialTheme.typography.labelSmall,
-        )
+    Row(modifier = Modifier.fillMaxWidth().padding(top = 6.dp)) {
+        Text("$label ($unit)", modifier = Modifier.weight(1.5f), style = MaterialTheme.typography.labelMedium)
+        listOf(values.min(), values.average(), values.max()).forEach {
+            Text(
+                formatHistory(it),
+                modifier = Modifier.weight(1f),
+                style = MaterialTheme.typography.labelMedium,
+                fontFamily = com.smartplug.app.ui.theme.SmartPlugMono,
+                textAlign = androidx.compose.ui.text.style.TextAlign.End,
+            )
+        }
     }
 }
+
+/** Energy used in each of seven equal time slots (cumulative counter deltas) with short labels. */
+private fun energyBuckets(points: List<EnergyHistoryPoint>, slots: Int = 7): Pair<List<Double>, List<String>> {
+    val sorted = points.sortedBy { it.timestampUtcMs }
+    if (sorted.size < 2) return emptyList<Double>() to emptyList()
+    val start = sorted.first().timestampUtcMs
+    val span = (sorted.last().timestampUtcMs - start).coerceAtLeast(1L)
+    val longRange = span > 36L * 3_600_000L
+    val label = java.text.SimpleDateFormat(if (longRange) "d/M" else "HH:mm", Locale.US)
+    fun energyAt(t: Long) = sorted.lastOrNull { it.timestampUtcMs <= t }?.energyWh ?: sorted.first().energyWh
+    val values = (0 until slots).map { i ->
+        val from = start + span * i / slots
+        val to = start + span * (i + 1) / slots
+        ((energyAt(to) - energyAt(from)) / 1000.0).coerceAtLeast(0.0)
+    }
+    val labels = (0 until slots).map { i -> label.format(java.util.Date(start + span * i / slots)) }
+    return values to labels
+}
+
+private class HistoryMetric(
+    val chip: String,
+    val title: String,
+    val unit: String,
+    val value: (EnergyHistoryPoint) -> Double,
+)
 
 private fun formatHistory(value: Double): String = String.format(Locale.US, "%.2f", value)
 

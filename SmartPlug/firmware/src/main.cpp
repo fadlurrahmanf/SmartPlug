@@ -8,6 +8,7 @@
 // headers directly and excludes this file), so no host-side Arduino polyfill
 // is needed here.
 #include <Arduino.h>
+#include <Crypto.h>
 #include <ESP8266mDNS.h>
 #include <LittleFS.h>
 #include <math.h>
@@ -23,6 +24,8 @@
 #include "SmartPlugConfig.h"
 #include "SmartPlugAnomaly.h"
 #include "SmartPlugReliability.h"
+#include "SmartPlugCredentialVault.h"
+#include "SmartPlugMigration.h"
 #include "FactoryProfile.h"
 
 namespace {
@@ -34,6 +37,36 @@ bool initialize();
 bool resetForFactory();
 }
 }
+
+// BL0940 drives ZX about 570 us after each AC zero crossing. The ISR does
+// only the minimum safe work; the relay coil is always driven from the loop.
+volatile uint32_t zeroCrossSequence = 0;
+volatile uint32_t lastZeroCrossAtUs = 0;
+
+void IRAM_ATTR onZeroCross() {
+  const uint32_t nowUs = micros();
+  // A mains half-cycle is 8.3-10 ms. Reject contact/noise glitches that are
+  // much closer together without suppressing a valid 60 Hz edge.
+  if (nowUs - lastZeroCrossAtUs < 3000UL) return;
+  lastZeroCrossAtUs = nowUs;
+  ++zeroCrossSequence;
+}
+
+uint32_t zeroCrossSnapshot() {
+  noInterrupts();
+  const uint32_t snapshot = zeroCrossSequence;
+  interrupts();
+  return snapshot;
+}
+
+// EEPROM bytes 0..511 are reserved for the persistent SmartPlug settings in
+// every build profile. MQTT-enabled builds store their separate record at this
+// offset; REST-only and safe profiles still need the boundary for their static
+// layout check.
+constexpr size_t kMqttSettingsOffset = 512;
+// Reserved EEPROM tail for the temporary 64 KiB -> 32 KiB migration handoff.
+// It is intentionally outside both the API record and the MQTT record.
+constexpr size_t kMigrationEepromOffset = 768;
 
 
 // ===== BEGIN LatchingRelay.h =====
@@ -53,6 +86,10 @@ class LatchingRelay {
   bool busy() const;
   bool actuationAllowed() const;
   CommandedState commandedState() const;
+  // A queued pulse is intentionally cancelled when no fresh zero crossing
+  // arrives. Expose that terminal condition so clients cannot mistake a
+  // queued command for a completed transition.
+  bool zeroCrossTimedOut() const;
   // The physical relay has no auxiliary contact. During boot the firmware
   // derives an operational state from the meter current and records it here.
   void observeState(CommandedState state);
@@ -75,6 +112,11 @@ class LatchingRelay {
   unsigned long pulseStartedAt_ = 0;
   unsigned long lastPulseEndedAt_ = 0;
   bool hasPulsed_ = false;
+  bool waitingForZeroCross_ = false;
+  ActiveCoil queuedCoil_ = ActiveCoil::kNone;
+  uint32_t zeroCrossSequenceAtQueue_ = 0;
+  unsigned long zeroCrossQueuedAtMs_ = 0;
+  bool zeroCrossTimedOut_ = false;
 };
 // ===== END LatchingRelay.h =====
 
@@ -92,6 +134,8 @@ class SmartPlugMqtt {
     uint16_t port = 1883;
     String username;
     String baseTopic;
+    uint8_t protocol = 1U;
+    bool signingReady = false;
   };
 
   void begin();
@@ -107,15 +151,26 @@ class SmartPlugMqtt {
   bool takeRelayCommand(bool& turnOn);
   bool takeFactoryResetCommand();
   bool takeEnergySync(double& energyWh, bool& reset);
+  bool takeBootSnapshot(double& energyWh);
+  // Boot recovery requests are deliberately retried while the main loop is
+  // waiting for a server snapshot. A server can reject the first request
+  // during its short live-session handover window after a fast SmartPlug
+  // reboot, so a single request is not sufficient recovery evidence.
+  void requestBootSnapshot();
   void reportRelayCommandResult(bool turnOn, bool accepted);
   bool handleConsoleCommand(const char* command);
   bool configured() const;
   bool connected() const;
   bool mqttMode() const;
+  // Must be called only after LittleFS has mounted.  The signing material is
+  // deliberately separate from the EEPROM MQTT connection record.
+  void initializeSigningMaterial();
+  bool clearSigningMaterial();
   SettingsView settingsView() const;
   bool saveWebSettings(const String& mode, const String& host, uint16_t port,
                        const String& username, const String& password,
-                       const String& baseTopic);
+                       const String& baseTopic, uint8_t protocol = 0U,
+                       const String& signingSecret = String());
 
  private:
   void loadSettings();
@@ -124,9 +179,11 @@ class SmartPlugMqtt {
   void connectIfNeeded();
   void publishAvailability(const char* value);
   void publishState(bool retain = true);
-  void publishTelemetry();
-  void publishMeasurement(const char* parameter, double value, const char* unit);
   void publishMeasurements();
+  bool publishMessage(const char* suffix, const String& body, bool retain);
+  bool signingProtocolActive() const;
+  bool unwrapSignedDownlink(const String& fullTopic, const String& body,
+                            bool persistReplayGuard, String& payload) const;
   void onMessage(char* topic, const uint8_t* payload, unsigned int length);
   static void callback(char* topic, uint8_t* payload, unsigned int length);
   String deviceId() const;
@@ -150,9 +207,16 @@ class SmartPlugMqtt {
   bool energySyncPending_ = false;
   double syncedEnergyWh_ = 0.0;
   bool syncedEnergyReset_ = false;
+  bool bootSnapshotPending_ = false;
+  double bootSnapshotEnergyWh_ = 0.0;
+  // Enabled only after a broker that supports this optional protocol has sent
+  // at least one heartbeat. This preserves compatibility with older brokers.
+  bool brokerHeartbeatObserved_ = false;
+  unsigned long lastBrokerHeartbeatAtMs_ = 0;
   unsigned long lastConnectAttemptAtMs_ = 0;
   unsigned long reconnectBackoffMs_ = 5000UL;
   unsigned long lastTelemetryAtMs_ = 0;
+  unsigned long lastSnapshotRequestAtMs_ = 0;
   String lastPublishedRelayState_;
 };
 // ===== END SmartPlugMqtt.h =====
@@ -175,6 +239,10 @@ class SmartPlugApi {
   bool takeRuntimeCalibration(smartplug_metering::Calibration& calibration);
   bool takeEnergyReset();
   bool takeTimerOff();
+  // The timer expiry path is deliberately distinct from ordinary relay
+  // controls: its durable deadline must survive until the OFF transition has
+  // actually completed (or a bounded terminal failure has been surfaced).
+  void reportTimerOffRequestResult(bool accepted);
   void restorePersistedTimer();
   void serviceRealtimeClock();
   bool takeScheduledRelayCommand(bool& turnOn);
@@ -187,7 +255,8 @@ class SmartPlugApi {
                       uint32_t packetsOk, uint32_t packetsBad);
   void setStandbyState(bool detected, bool pending);
   void setVoltageAnomaly(const char* state);
-  void setRelayState(const char* relayState, bool actuationAllowed);
+  void setRelayState(const char* relayState, bool actuationAllowed,
+                     bool zeroCrossTimedOut);
   void setEnergyPersistenceStatus(bool ready, bool savedAvailable,
                                   double savedWh, uint32_t nextSaveSeconds);
 #if SMARTPLUG_ENABLE_MQTT
@@ -197,9 +266,6 @@ class SmartPlugApi {
  private:
   void startNetwork();
   void serviceMdns();
-  void handleDashboard();
-  void handleRawStatsScript();
-  void handleDashboardVersionScript();
   void handleDiscovery();
   void handleCapabilities();
   void handleStatus();
@@ -218,6 +284,12 @@ class SmartPlugApi {
   void handleSession();
   void handleRelayCommand();
   void handleAccessSettings();
+  void handleDisplayName();
+  void handleAccessProfile();
+  void handleAccessInvitation();
+  void handleAccessEnroll();
+  void handleAccessCredentials();
+  void handleAccessCredentialDelete();
 #if SMARTPLUG_ENABLE_MQTT
   void handleMqttSettings();
 #endif
@@ -232,6 +304,10 @@ class SmartPlugApi {
   void handlePairStatus();
   bool requirePairingToken();
   bool requireOwnerTokenBearer();
+  bool requireOperationalTokenBearer();
+  bool requireOperationalRead();
+  bool requireOwnerRole();
+  String accessProfileJson() const;
   String pairFailedJson(const char* reason) const;
   void sendJson(int code, const String& body);
   void sendError(int code, const char* error);
@@ -246,6 +322,10 @@ class SmartPlugApi {
   void clearSession();
   void addAuditEvent(const char* event);
   String scheduleJson() const;
+  // Direct-mode timers and schedules are a separate automation authority from
+  // ServerSmartPlug.  They must never be allowed to survive a mode hand-off.
+  bool localAutomationAllowed() const;
+  bool clearLocalAutomationForServerTransition();
   String deviceId() const;
   String randomHex(size_t bytes) const;
   String calibrationState() const;
@@ -279,6 +359,10 @@ class SmartPlugApi {
   uint32_t energyNextSaveSeconds_ = 0;
   uint32_t timerDeadlineUtc_ = 0;
   uint32_t timerArmedSeconds_ = 0;
+  bool timerExpiryCommandInFlight_ = false;
+  bool timerExpiryTerminalFailure_ = false;
+  uint8_t timerExpiryAttempts_ = 0U;
+  unsigned long timerExpiryRetryAtMs_ = 0UL;
   int64_t lastScheduleMinute_ = -1;
   bool clockConfigured_ = false;
   bool requestedRelayOn_ = false;
@@ -306,6 +390,10 @@ class SmartPlugApi {
   // response that hands it to the app; EEPROM only ever stores its salted
   // hash (see ownerTokenSalt/ownerTokenHash on PersistentSettings).
   String pairingIssuedOwnerToken_;
+  String accessInviteCode_;
+  unsigned long accessInviteExpiresAtMs_ = 0;
+  uint8_t accessInviteFailures_ = 0;
+  unsigned long accessInviteLockUntilMs_ = 0;
 };
 // ===== END SmartPlugApi.h =====
 
@@ -331,6 +419,28 @@ void LatchingRelay::begin() {
 }
 
 void LatchingRelay::tick() {
+  if (waitingForZeroCross_) {
+    if (zeroCrossSnapshot() == zeroCrossSequenceAtQueue_) {
+      // Do not wait indefinitely if AC/ZX is unavailable. In that case a
+      // relay pulse is deliberately not emitted at an arbitrary phase.
+      if (millis() - zeroCrossQueuedAtMs_ >= 25UL) {
+        waitingForZeroCross_ = false;
+        queuedCoil_ = ActiveCoil::kNone;
+        pendingState_ = CommandedState::kUnknown;
+        zeroCrossTimedOut_ = true;
+        Serial.println(F("WARN relay_zero_cross_timeout"));
+      }
+      return;
+    }
+
+    digitalWrite(queuedCoil_ == ActiveCoil::kSet ? setPin_ : resetPin_, HIGH);
+    activeCoil_ = queuedCoil_;
+    queuedCoil_ = ActiveCoil::kNone;
+    waitingForZeroCross_ = false;
+    pulseStartedAt_ = millis();
+    return;
+  }
+
   if (activeCoil_ == ActiveCoil::kNone) {
     return;
   }
@@ -361,7 +471,7 @@ bool LatchingRelay::requestOff() {
 
 bool LatchingRelay::request(const ActiveCoil coil,
                             const CommandedState resultingState) {
-  if (!actuationAllowed_ || activeCoil_ != ActiveCoil::kNone) {
+  if (!actuationAllowed_ || activeCoil_ != ActiveCoil::kNone || waitingForZeroCross_) {
     return false;
   }
   // Replayed MQTT/REST commands to the known state are idempotent. They do
@@ -372,10 +482,12 @@ bool LatchingRelay::request(const ActiveCoil coil,
   }
 
   driveBothLow();
-  digitalWrite(coil == ActiveCoil::kSet ? setPin_ : resetPin_, HIGH);
-  activeCoil_ = coil;
+  queuedCoil_ = coil;
   pendingState_ = resultingState;
-  pulseStartedAt_ = millis();
+  zeroCrossTimedOut_ = false;
+  zeroCrossSequenceAtQueue_ = zeroCrossSnapshot();
+  zeroCrossQueuedAtMs_ = millis();
+  waitingForZeroCross_ = true;
   return true;
 }
 
@@ -385,10 +497,12 @@ void LatchingRelay::driveBothLow() {
 }
 
 bool LatchingRelay::busy() const {
-  return activeCoil_ != ActiveCoil::kNone;
+  return activeCoil_ != ActiveCoil::kNone || waitingForZeroCross_;
 }
 
 bool LatchingRelay::actuationAllowed() const { return actuationAllowed_; }
+
+bool LatchingRelay::zeroCrossTimedOut() const { return zeroCrossTimedOut_; }
 
 LatchingRelay::CommandedState LatchingRelay::commandedState() const {
   return commandedState_;
@@ -428,12 +542,12 @@ const char* LatchingRelay::stateText() const {
 
 namespace {
 
-constexpr size_t kMqttSettingsOffset = 512;
 constexpr uint32_t kMqttSettingsMagic = 0x53504D31UL;  // SPM1
 constexpr uint16_t kMqttSettingsVersion = 2;
 constexpr unsigned long kReconnectInitialMs = 5000UL;
 constexpr unsigned long kReconnectMaximumMs = 60000UL;
 constexpr unsigned long kTelemetryIntervalMs = 500UL;
+constexpr unsigned long kBrokerHeartbeatTimeoutMs = 3500UL;
 
 struct MqttSettings {
   uint32_t magic;
@@ -449,6 +563,9 @@ struct MqttSettings {
 
 static_assert(sizeof(MqttSettings) <= 512,
               "MQTT settings exceed the reserved EEPROM sector.");
+static_assert(kMqttSettingsOffset + sizeof(MqttSettings) <=
+                  kMigrationEepromOffset,
+              "MQTT settings overlap the migration handoff area.");
 
 MqttSettings mqttSettings = {};
 WiFiClient mqttWifiClient;
@@ -471,6 +588,21 @@ uint32_t mqttSettingsCrc(MqttSettings value) {
   return mqttCrc32(reinterpret_cast<const uint8_t*>(&value), sizeof(value));
 }
 
+String mqttSignHmac(const String& message, const String& key) {
+  return experimental::crypto::SHA256::hmac(
+      message, key.c_str(), key.length(),
+      experimental::crypto::SHA256::NATURAL_LENGTH);
+}
+
+bool mqttConstantTimeEquals(const String& left, const String& right) {
+  if (left.length() != right.length()) return false;
+  uint8_t difference = 0U;
+  for (size_t index = 0; index < left.length(); ++index) {
+    difference |= static_cast<uint8_t>(left[index] ^ right[index]);
+  }
+  return difference == 0U;
+}
+
 void mqttCopyText(char* destination, const size_t size, const String& value) {
   value.substring(0, size - 1).toCharArray(destination, size);
 }
@@ -481,6 +613,160 @@ bool mqttBrokerFieldsValid() {
   return mqttSettings.host[0] != '\0' && mqttSettings.port > 0 &&
          mqttSettings.baseTopic[0] != '\0';
 }
+
+// SPMQTT2 signing material intentionally lives in LittleFS, never in the
+// EEPROM MQTT connection record.  The two-slot format means a power loss while
+// rotating the boot epoch or provisioning a secret leaves the previous valid
+// record usable.  A boot epoch is persisted once per boot so the RAM-only
+// outbound sequence can never repeat with the same signing key after restart.
+namespace mqtt_auth {
+constexpr uint32_t kMagic = 0x53504D32UL;  // SPM2
+constexpr uint16_t kSchema = 1U;
+constexpr const char* kSlots[] = {"/mqtt-auth-a.dat", "/mqtt-auth-b.dat"};
+constexpr size_t kSecretBytes = 65U;  // 64 printable chars plus NUL.
+
+struct Record {
+  uint32_t magic;
+  uint16_t schema;
+  uint16_t reserved;
+  uint32_t sequence;
+  uint32_t bootEpoch;
+  uint32_t lastCommandEpoch;
+  uint32_t lastCommandNonce;
+  char secret[kSecretBytes];
+  uint32_t crc;
+};
+
+bool ready = false;
+bool corrupt = false;
+int activeSlot = -1;
+Record current = {};
+uint32_t outboundNonce = 0U;
+
+uint32_t recordCrc(Record record) {
+  record.crc = 0U;
+  return mqttCrc32(reinterpret_cast<const uint8_t*>(&record), sizeof(record));
+}
+
+bool validSecret(const String& value) {
+  if (value.length() < 32U || value.length() >= kSecretBytes) return false;
+  for (size_t index = 0; index < value.length(); ++index) {
+    const char c = value[index];
+    if (c < 0x21 || c > 0x7EU) return false;
+  }
+  return true;
+}
+
+bool validRecord(const Record& record) {
+  return record.magic == kMagic && record.schema == kSchema &&
+         record.crc == recordCrc(record) &&
+         memchr(record.secret, '\0', sizeof(record.secret)) != nullptr &&
+         validSecret(String(record.secret));
+}
+
+bool newer(const uint32_t candidate, const uint32_t previous) {
+  const uint32_t delta = candidate - previous;
+  return delta != 0U && delta < 0x80000000UL;
+}
+
+bool readSlot(const int slot, Record& record) {
+  File file = LittleFS.open(kSlots[slot], "r");
+  if (!file || file.size() != sizeof(record)) return false;
+  const bool read = file.read(reinterpret_cast<uint8_t*>(&record), sizeof(record)) == sizeof(record);
+  file.close();
+  return read && validRecord(record);
+}
+
+bool save(Record next) {
+  if (!ready || !validSecret(String(next.secret))) return false;
+  next.magic = kMagic;
+  next.schema = kSchema;
+  next.reserved = 0U;
+  next.sequence = current.sequence + 1U;
+  next.crc = recordCrc(next);
+  const int target = activeSlot == 0 ? 1 : 0;
+  File file = LittleFS.open(kSlots[target], "w");
+  if (!file) return false;
+  const bool written = file.write(reinterpret_cast<const uint8_t*>(&next), sizeof(next)) == sizeof(next);
+  file.flush();
+  file.close();
+  Record verified = {};
+  if (!written || !readSlot(target, verified) || verified.sequence != next.sequence) return false;
+  current = verified;
+  activeSlot = target;
+  corrupt = false;
+  return true;
+}
+
+bool initialize() {
+  ready = true;  // Caller has already mounted LittleFS without auto-format.
+  corrupt = false;
+  activeSlot = -1;
+  current = {};
+  outboundNonce = 0U;
+  Record a = {}, b = {};
+  const bool validA = readSlot(0, a);
+  const bool validB = readSlot(1, b);
+  // One verified slot is sufficient recovery evidence; the next epoch/nonce
+  // write repairs the other slot. Only two unusable existing slots fail
+  // closed instead of silently falling back to unsigned MQTT.
+  corrupt = !validA && !validB &&
+            (LittleFS.exists(kSlots[0]) || LittleFS.exists(kSlots[1]));
+  if (!validA && !validB) return !corrupt;
+  if (validB && (!validA || newer(b.sequence, a.sequence))) {
+    current = b; activeSlot = 1;
+  } else {
+    current = a; activeSlot = 0;
+  }
+  // A write-verified epoch advance happens before the first signed publish.
+  Record next = current;
+  ++next.bootEpoch;
+  const bool advanced = save(next);
+  if (!advanced) corrupt = true;  // never reuse an unverified boot epoch
+  return advanced;
+}
+
+bool provision(const String& secret) {
+  if (!ready || !validSecret(secret)) return false;
+  Record next = current;
+  secret.toCharArray(next.secret, sizeof(next.secret));
+  if (next.bootEpoch == 0U) next.bootEpoch = 1U;
+  else ++next.bootEpoch;
+  next.lastCommandEpoch = 0U;
+  next.lastCommandNonce = 0U;
+  outboundNonce = 0U;
+  return save(next);
+}
+
+bool active() { return ready && !corrupt && validSecret(String(current.secret)); }
+bool unavailable() { return corrupt; }
+String secret() { return active() ? String(current.secret) : String(); }
+uint32_t bootEpoch() { return current.bootEpoch; }
+uint32_t nextNonce() { return ++outboundNonce; }
+
+// Persist every accepted SPMQTT2 downlink. Snapshot and energy messages can
+// affect the recovered counter (including an authenticated reset), so treating
+// them as replayable would weaken the same recovery guarantee as relay/factory
+// commands. They are bounded control/recovery traffic, never 500 ms telemetry.
+bool acceptCommandNonce(const uint32_t epoch, const uint32_t nonce) {
+  if (!active()) return false;
+  if (epoch < current.lastCommandEpoch ||
+      (epoch == current.lastCommandEpoch && nonce <= current.lastCommandNonce)) return false;
+  Record next = current;
+  next.lastCommandEpoch = epoch;
+  next.lastCommandNonce = nonce;
+  return save(next);
+}
+
+bool clear() {
+  bool ok = true;
+  for (const char* path : kSlots) {
+    if (LittleFS.exists(path) && !LittleFS.remove(path)) ok = false;
+  }
+  ready = false; corrupt = false; activeSlot = -1; current = {}; outboundNonce = 0U;
+  return ok;
+}
+}  // namespace mqtt_auth
 
 }  // namespace
 
@@ -542,6 +828,9 @@ bool SmartPlugMqtt::saveSettings() {
 
 void SmartPlugMqtt::clearSettings() {
   mqttClient.disconnect();
+  // An explicit MQTT clear is a deprovisioning operation, so it must not
+  // leave a reusable server signing secret on the device.
+  mqtt_auth::clear();
   mqttSettings = {};
   EEPROM.put(kMqttSettingsOffset, mqttSettings);
   EEPROM.commit();
@@ -552,6 +841,17 @@ void SmartPlugMqtt::clearSettings() {
 bool SmartPlugMqtt::configured() const { return settingsValid_; }
 bool SmartPlugMqtt::connected() const { return mqttClient.connected(); }
 bool SmartPlugMqtt::mqttMode() const { return mqttModeSelected(); }
+bool SmartPlugMqtt::signingProtocolActive() const { return mqtt_auth::active(); }
+
+void SmartPlugMqtt::initializeSigningMaterial() {
+  if (!mqtt_auth::initialize()) {
+    Serial.println(F("WARN mqtt_signing_material_unavailable"));
+  } else if (mqtt_auth::active()) {
+    Serial.println(F("INFO mqtt_spmqtt2_signing_ready"));
+  }
+}
+
+bool SmartPlugMqtt::clearSigningMaterial() { return mqtt_auth::clear(); }
 
 SmartPlugMqtt::SettingsView SmartPlugMqtt::settingsView() const {
   SettingsView view;
@@ -562,14 +862,19 @@ SmartPlugMqtt::SettingsView SmartPlugMqtt::settingsView() const {
   view.port = mqttSettings.port == 0 ? 1883 : mqttSettings.port;
   view.username = String(mqttSettings.username);
   view.baseTopic = String(mqttSettings.baseTopic);
+  view.protocol = signingProtocolActive() ? 2U : 1U;
+  view.signingReady = signingProtocolActive();
   return view;
 }
 
 bool SmartPlugMqtt::saveWebSettings(const String& mode, const String& host, const uint16_t port,
                                      const String& username,
                                      const String& password,
-                                     const String& baseTopic) {
+                                     const String& baseTopic,
+                                     const uint8_t protocol,
+                                     const String& signingSecret) {
   if ((mode != "rest" && mode != "mqtt") ||
+      (protocol != 0U && protocol != 1U && protocol != 2U) ||
       !validText(username, 0, sizeof(mqttSettings.username) - 1) ||
       !validText(password, 0, sizeof(mqttSettings.password) - 1) ||
       (mode == "mqtt" && (!validText(host, 1, sizeof(mqttSettings.host) - 1) ||
@@ -591,6 +896,28 @@ bool SmartPlugMqtt::saveWebSettings(const String& mode, const String& host, cons
     settingsValid_ = mqttModeSelected() && mqttBrokerFieldsValid();
     return false;
   }
+  // Commit the connection record before changing the distinct LittleFS
+  // signing record.  If a signing transition cannot be persisted, restore
+  // the old EEPROM profile so a working server is never left with a changed
+  // host/password paired to an old (or missing) signing secret.
+  bool signingChanged = true;
+  if (protocol == 2U) {
+    if (!mqtt_auth::active() && !mqtt_auth::unavailable()) initializeSigningMaterial();
+    signingChanged = !mqtt_auth::unavailable() &&
+        ((!signingSecret.isEmpty() && mqtt_auth::provision(signingSecret)) ||
+         (signingSecret.isEmpty() && mqtt_auth::active()));
+  } else if (protocol == 1U && mqtt_auth::active()) {
+    // Explicit protocol=1 is a deliberate legacy downgrade/deprovisioning.
+    // Omitted protocol (0) preserves existing signing during old-app updates.
+    signingChanged = mqtt_auth::clear();
+  }
+  if (!signingChanged) {
+    mqttSettings = previous;
+    EEPROM.put(kMqttSettingsOffset, previous);
+    EEPROM.commit();
+    settingsValid_ = mqttModeSelected() && mqttBrokerFieldsValid();
+    return false;
+  }
   mqttClient.disconnect();
   lastConnectAttemptAtMs_ = 0;
   return true;
@@ -600,7 +927,10 @@ void SmartPlugMqtt::begin() {
   activeMqtt = this;
   loadSettings();
   mqttClient.setCallback(SmartPlugMqtt::callback);
-  mqttClient.setBufferSize(512);
+  // SPMQTT2 adds device/boot/nonce/signature metadata to the atomic sample.
+  // Leave enough room for the longest allowed base topic and numeric fields;
+  // otherwise PubSubClient silently returns false for a valid signed publish.
+  mqttClient.setBufferSize(768);
   mqttClient.setKeepAlive(30);
   mqttClient.setSocketTimeout(2);
   if (mqttSettings.baseTopic[0] == '\0') {
@@ -613,62 +943,141 @@ void SmartPlugMqtt::begin() {
 
 void SmartPlugMqtt::publishAvailability(const char* value) {
   const String destination = topic("availability");
-  mqttClient.publish(destination.c_str(), value, true);
+  if (!signingProtocolActive()) {
+    mqttClient.publish(destination.c_str(), value, true);
+    return;
+  }
+  publishMessage("availability", String("{\"status\":\"") + value + "\"}", true);
+}
+
+bool SmartPlugMqtt::publishMessage(const char* suffix, const String& body,
+                                   const bool retain) {
+  if (!mqttClient.connected()) return false;
+  const String destination = topic(suffix);
+  if (!signingProtocolActive()) return mqttClient.publish(destination.c_str(), body.c_str(), retain);
+  const uint32_t nonce = mqtt_auth::nextNonce();
+  const uint32_t boot = mqtt_auth::bootEpoch();
+  // Canonical SPMQTT2 form. `body` is compact JSON generated locally and is
+  // signed byte-for-byte, including its field order.  The full destination
+  // topic binds a valid payload to exactly one device/topic.
+  const String canonical = String("SPMQTT2|v=2|dir=up|topic=") + destination +
+      "|device=" + deviceId() + "|boot=" + String(boot) + "|nonce=" +
+      String(nonce) + "|payload=" + body;
+  const String signature = mqttSignHmac(canonical, mqtt_auth::secret());
+  const String envelope = String("{\"protocol\":2,\"device_id\":\"") +
+      deviceId() + "\",\"boot\":" + String(boot) + ",\"nonce\":" +
+      String(nonce) + ",\"payload\":" + body + ",\"sig\":\"" + signature + "\"}";
+  return mqttClient.publish(destination.c_str(), envelope.c_str(), retain);
+}
+
+bool SmartPlugMqtt::unwrapSignedDownlink(const String& fullTopic,
+                                          const String& body,
+                                          const bool persistReplayGuard,
+                                          String& payload) const {
+  if (!signingProtocolActive()) { payload = body; return true; }
+  const auto numberField = [](const String& source, const char* key, uint32_t& value) {
+    const String marker = String("\"") + key + "\":";
+    int at = source.indexOf(marker);
+    if (at < 0) return false;
+    at += marker.length();
+    if (at >= static_cast<int>(source.length()) || !isDigit(source[at])) return false;
+    uint32_t parsed = 0U;
+    while (at < static_cast<int>(source.length()) && isDigit(source[at])) {
+      const uint8_t digit = static_cast<uint8_t>(source[at++] - '0');
+      if (parsed > (UINT32_MAX - digit) / 10U) return false;
+      parsed = parsed * 10U + digit;
+    }
+    value = parsed;
+    return true;
+  };
+  const auto stringField = [](const String& source, const char* key, String& value) {
+    const String marker = String("\"") + key + "\":\"";
+    int at = source.indexOf(marker);
+    if (at < 0) return false;
+    at += marker.length();
+    const int end = source.indexOf('"', at);
+    if (end < at) return false;
+    value = source.substring(at, end);
+    return value.indexOf('\\') < 0;
+  };
+  const String payloadMarker(F("\"payload\":"));
+  int at = body.indexOf(payloadMarker);
+  if (at < 0) return false;
+  at += payloadMarker.length();
+  if (at >= static_cast<int>(body.length()) || body[at] != '{') return false;
+  const int payloadStart = at;
+  uint8_t depth = 0U;
+  bool quoted = false;
+  bool escaped = false;
+  for (; at < static_cast<int>(body.length()); ++at) {
+    const char c = body[at];
+    if (quoted) {
+      if (escaped) escaped = false;
+      else if (c == '\\') escaped = true;
+      else if (c == '"') quoted = false;
+      continue;
+    }
+    if (c == '"') { quoted = true; continue; }
+    if (c == '{') ++depth;
+    else if (c == '}' && --depth == 0U) { ++at; break; }
+  }
+  if (depth != 0U) return false;
+  payload = body.substring(payloadStart, at);
+  uint32_t protocol = 0U, boot = 0U, nonce = 0U;
+  String signedDevice, signature;
+  if (!numberField(body, "protocol", protocol) || protocol != 2U ||
+      !numberField(body, "boot", boot) || !numberField(body, "nonce", nonce) ||
+      !stringField(body, "device_id", signedDevice) ||
+      !stringField(body, "sig", signature) || signedDevice != deviceId()) return false;
+  // A signature from an earlier SmartPlug boot is not a valid command for
+  // this boot. This prevents a captured relay/factory/recovery envelope from
+  // crossing boot epochs even when its nonce was never seen locally.
+  if (boot != mqtt_auth::bootEpoch()) return false;
+  const String canonical = String("SPMQTT2|v=2|dir=down|topic=") + fullTopic +
+      "|device=" + signedDevice + "|boot=" + String(boot) + "|nonce=" +
+      String(nonce) + "|payload=" + payload;
+  if (!mqttConstantTimeEquals(mqttSignHmac(canonical, mqtt_auth::secret()), signature)) return false;
+  return !persistReplayGuard || mqtt_auth::acceptCommandNonce(boot, nonce);
+}
+
+void SmartPlugMqtt::requestBootSnapshot() {
+  if (!mqttClient.connected()) return;
+  const unsigned long now = millis();
+  if (lastSnapshotRequestAtMs_ != 0U &&
+      now - lastSnapshotRequestAtMs_ < 1000UL) return;
+  // The request itself is signed in SPMQTT2 mode and carries a fresh uplink
+  // nonce. It is safe to retry until the main loop consumes a snapshot or
+  // reaches its documented LittleFS fallback deadline.
+  if (publishMessage("sync/request", "{\"version\":2}", false)) {
+    lastSnapshotRequestAtMs_ = now;
+  }
 }
 
 void SmartPlugMqtt::publishState(const bool retain) {
   if (!mqttClient.connected()) return;
-  const String destination = topic("state");
   String body = "{\"device_id\":\"" + deviceId() + "\",\"relay\":\"" +
                 relayState_ + "\",\"relay_actuation\":" +
                 (relayActuationAllowed_ ? "true" : "false") +
                 ",\"wifi_connected\":" +
                 (WiFi.status() == WL_CONNECTED ? "true" : "false") + "}";
-  mqttClient.publish(destination.c_str(), body.c_str(), retain);
+  publishMessage("state", body, retain);
   lastPublishedRelayState_ = relayState_;
-}
-
-void SmartPlugMqtt::publishTelemetry() {
-  if (!mqttClient.connected() || !hasSample_) return;
-  const String destination = topic("telemetry");
-  String body = "{\"device_id\":\"" + deviceId() + "\",\"captured_at_ms\":" +
-                String(capturedAtMs_) + ",\"calibrated\":" +
-                (electrical_.calibrated ? "true" : "false") +
-                ",\"voltage_v\":" + String(electrical_.voltageV, 3) +
-                ",\"current_a\":" + String(electrical_.currentA, 4) +
-                ",\"active_power_w\":" + String(electrical_.activePowerW, 2) +
-                ",\"apparent_power_va\":" + String(electrical_.apparentPowerVa, 2) +
-                ",\"power_factor\":" + String(electrical_.powerFactor, 3) +
-                ",\"energy_wh\":" + String(electrical_.energyWhSinceBoot, 3) +
-                ",\"raw_codes\":{\"i_rms\":" + String(raw_.currentRms) +
-                ",\"v_rms\":" + String(raw_.voltageRms) +
-                ",\"active_power\":" + String(raw_.activePower) +
-                "},\"packets_ok\":" + String(packetsOk_) +
-                ",\"packets_bad\":" + String(packetsBad_) + "}";
-  mqttClient.publish(destination.c_str(), body.c_str(), false);
-}
-
-void SmartPlugMqtt::publishMeasurement(const char* parameter, const double value,
-                                       const char* unit) {
-  if (!mqttClient.connected() || !hasSample_) return;
-  const String destination = topic("measurement/") + parameter;
-  const String body = String("{\"device_id\":\"") + deviceId() +
-                      "\",\"captured_at_ms\":" + String(capturedAtMs_) +
-                      ",\"parameter\":\"" + parameter +
-                      "\",\"value\":" + String(value, 3) +
-                      ",\"unit\":\"" + unit + "\"}";
-  mqttClient.publish(destination.c_str(), body.c_str(), false);
 }
 
 void SmartPlugMqtt::publishMeasurements() {
   if (!mqttClient.connected() || !hasSample_) return;
-  publishMeasurement("voltage", electrical_.voltageV, "V");
-  publishMeasurement("current", electrical_.currentA, "A");
-  publishMeasurement("active-power", electrical_.activePowerW, "W");
-  publishMeasurement("apparent-power", electrical_.apparentPowerVa, "VA");
-  publishMeasurement("power-factor", electrical_.powerFactor, "PF");
-  publishMeasurement("energy", electrical_.energyWhSinceBoot, "Wh");
-  const String destination = topic("measurement/allparameters");
+  // `String(NAN)` serializes as `nan`, which is not legal JSON.  Publishing
+  // such an atomic sample makes an otherwise healthy signed SPMQTT2 envelope
+  // fail at the ServerSmartPlug JSON boundary.  Do not manufacture zeroes:
+  // keep the previous server snapshot and wait for the next physical sample.
+  if (!isfinite(electrical_.voltageV) || !isfinite(electrical_.currentA) ||
+      !isfinite(electrical_.activePowerW) || !isfinite(electrical_.apparentPowerVa) ||
+      !isfinite(electrical_.powerFactor) || !isfinite(electrical_.energyWhSinceBoot)) {
+    return;
+  }
+  // One complete atomic sample every 500 ms is the canonical server telemetry.
+  // ServerSmartPlug retains support for the older individual measurement topics
+  // so already-deployed firmware remains compatible.
   const String body = String("{\"device_id\":\"") + deviceId() +
       "\",\"captured_at_ms\":" + String(capturedAtMs_) +
       ",\"calibrated\":" + (electrical_.calibrated ? "true" : "false") +
@@ -678,27 +1087,60 @@ void SmartPlugMqtt::publishMeasurements() {
       ",\"apparent_power_va\":" + String(electrical_.apparentPowerVa, 2) +
       ",\"power_factor\":" + String(electrical_.powerFactor, 3) +
       ",\"energy_wh\":" + String(electrical_.energyWhSinceBoot, 3) + "}";
-  mqttClient.publish(destination.c_str(), body.c_str(), false);
+  publishMessage("measurement/allparameters", body, false);
 }
 
 void SmartPlugMqtt::connectIfNeeded() {
   if (!mqttModeSelected() || !settingsValid_ || mqttClient.connected() ||
       WiFi.status() != WL_CONNECTED) return;
+  // Existing MQTT deployments without signing material remain legacy.  A
+  // partially corrupted SPMQTT2 record must never silently downgrade to
+  // unsigned MQTT, so leave the transport disconnected until reprovisioned.
+  if (mqtt_auth::unavailable()) {
+    static unsigned long lastWarningAt = 0U;
+    if (millis() - lastWarningAt > 10000UL) {
+      lastWarningAt = millis();
+      Serial.println(F("ERR mqtt_signing_material_corrupt"));
+    }
+    return;
+  }
   const unsigned long now = millis();
   if (lastConnectAttemptAtMs_ != 0 &&
       now - lastConnectAttemptAtMs_ < reconnectBackoffMs_) return;
   lastConnectAttemptAtMs_ = now;
-  mqttClient.setServer(mqttSettings.host, mqttSettings.port);
+  // ServerSmartPlug is normally configured with a LAN IPv4 address.  Give
+  // PubSubClient an IPAddress in that case instead of routing a numeric string
+  // through the ESP8266 hostname resolver; some network/core combinations can
+  // otherwise time out before opening the local TCP socket.
+  IPAddress brokerAddress;
+  if (brokerAddress.fromString(mqttSettings.host)) {
+    mqttClient.setServer(brokerAddress, mqttSettings.port);
+  } else {
+    mqttClient.setServer(mqttSettings.host, mqttSettings.port);
+  }
   const String clientId = "SmartPlug-" + deviceId();
   const String willTopic = topic("availability");
+  String willPayload("offline");
+  if (signingProtocolActive()) {
+    const uint32_t nonce = mqtt_auth::nextNonce();
+    const uint32_t boot = mqtt_auth::bootEpoch();
+    const String inner(F("{\"status\":\"offline\"}"));
+    const String canonical = String("SPMQTT2|v=2|dir=up|topic=") + willTopic +
+        "|device=" + deviceId() + "|boot=" + String(boot) + "|nonce=" +
+        String(nonce) + "|payload=" + inner;
+    willPayload = String("{\"protocol\":2,\"device_id\":\"") + deviceId() +
+        "\",\"boot\":" + String(boot) + ",\"nonce\":" + String(nonce) +
+        ",\"payload\":" + inner + ",\"sig\":\"" +
+        mqttSignHmac(canonical, mqtt_auth::secret()) + "\"}";
+  }
   const bool hasCredentials = mqttSettings.username[0] != '\0';
-  const bool connected = hasCredentials
+  const bool mqttConnected = hasCredentials
       ? mqttClient.connect(clientId.c_str(), mqttSettings.username,
                            mqttSettings.password, willTopic.c_str(), 1, true,
-                           "offline")
+                           willPayload.c_str())
       : mqttClient.connect(clientId.c_str(), willTopic.c_str(), 1, true,
-                           "offline");
-  if (!connected) {
+                           willPayload.c_str());
+  if (!mqttConnected) {
     reconnectBackoffMs_ = min(kReconnectMaximumMs, reconnectBackoffMs_ * 2UL);
     Serial.print(F("WARN mqtt_connect_failed state="));
     Serial.println(mqttClient.state());
@@ -710,7 +1152,18 @@ void SmartPlugMqtt::connectIfNeeded() {
   mqttClient.subscribe(factoryResetTopic.c_str());
   const String energySyncTopic = topic("sync/energy");
   mqttClient.subscribe(energySyncTopic.c_str());
+  const String snapshotTopic = topic("sync/snapshot");
+  mqttClient.subscribe(snapshotTopic.c_str());
+  // New ServerSmartPlug firmware broadcasts this optional heartbeat. It lets
+  // an ESP8266 detect a silently lost TCP session shortly after a broker reboot.
+  mqttClient.subscribe("smartplug/broker/heartbeat");
+  brokerHeartbeatObserved_ = false;
+  lastBrokerHeartbeatAtMs_ = 0;
   reconnectBackoffMs_ = kReconnectInitialMs;
+  // A newly booted server-mode SmartPlug actively asks for recovery state
+  // before announcing/publishing its normal live status.
+  lastSnapshotRequestAtMs_ = 0U;
+  requestBootSnapshot();
   publishAvailability("online");
   publishState(true);
   Serial.println(F("INFO mqtt_connected"));
@@ -726,44 +1179,74 @@ void SmartPlugMqtt::onMessage(char* topicName, const uint8_t* payload,
   const String expected = topic("cmd/relay");
   const String factoryResetTopic = topic("cmd/factory-reset");
   const String energySyncTopic = topic("sync/energy");
-  if (length == 0 || length > 192U) return;
-  if (String(topicName) == energySyncTopic) {
-    String body;
-    for (unsigned int i = 0; i < length; ++i) body += static_cast<char>(payload[i]);
-    const int fieldAt = body.indexOf("\"energy_wh\":");
+  const String snapshotTopic = topic("sync/snapshot");
+  if (length == 0 || length > 480U) return;
+  if (String(topicName) == "smartplug/broker/heartbeat") {
+    brokerHeartbeatObserved_ = true;
+    lastBrokerHeartbeatAtMs_ = millis();
+    return;
+  }
+  const String receivedTopic(topicName);
+  String body;
+  body.reserve(length);
+  for (unsigned int i = 0; i < length; ++i) body += static_cast<char>(payload[i]);
+  String commandBody;
+  // Signed snapshot and energy-reset traffic can alter persistent energy.
+  // Give every signed downlink the same durable replay guard as relay/factory
+  // commands; legacy MQTT keeps its established raw-message behavior.
+  if (!unwrapSignedDownlink(receivedTopic, body, signingProtocolActive(), commandBody)) {
+    Serial.println(F("WARN mqtt_downlink_signature_rejected"));
+    return;
+  }
+  if (String(topicName) == snapshotTopic) {
+    const int fieldAt = commandBody.indexOf("\"energy_wh\":");
     if (fieldAt < 0) return;
-    const char* begin = body.c_str() + fieldAt + 12;
+    const char* numberStart = commandBody.c_str() + fieldAt + 12;
     char* end = nullptr;
-    const double candidate = strtod(begin, &end);
+    const double candidate = strtod(numberStart, &end);
+    if (end == numberStart || !end || !smartplug_reliability::validEnergy(candidate)) return;
+    // Do not read relay_state from a snapshot into the relay command path.
+    // Snapshot recovery is energy continuity only; physical sensing stays live.
+    bootSnapshotEnergyWh_ = candidate;
+    bootSnapshotPending_ = true;
+    return;
+  }
+  if (String(topicName) == energySyncTopic) {
+    const int fieldAt = commandBody.indexOf("\"energy_wh\":");
+    if (fieldAt < 0) return;
+    const char* numberStart = commandBody.c_str() + fieldAt + 12;
+    char* end = nullptr;
+    const double candidate = strtod(numberStart, &end);
     while (end && *end == ' ') ++end;
-    if (end == begin || !end || (*end != ',' && *end != '}') ||
+    if (end == numberStart || !end || (*end != ',' && *end != '}') ||
         !smartplug_reliability::validEnergy(candidate)) return;
     // The MQTT server owns the durable energy database.  A valid snapshot is
     // therefore accepted as the current counter after a reconnect.
     syncedEnergyWh_ = candidate;
-    syncedEnergyReset_ = body.indexOf("\"reset\":true") >= 0;
+    syncedEnergyReset_ = commandBody.indexOf("\"reset\":true") >= 0;
     energySyncPending_ = true;
     return;
   }
   if (String(topicName) == factoryResetTopic) {
-    String command;
-    for (unsigned int i = 0; i < length; ++i) command += static_cast<char>(payload[i]);
+    String command = signingProtocolActive()
+        ? (commandBody.indexOf("\"command\":\"FACTORY_RESET\"") >= 0 ? "FACTORY_RESET" : String())
+        : commandBody;
     command.trim();
     if (command == "FACTORY_RESET") factoryResetCommandPending_ = true;
     return;
   }
-  if (String(topicName) != expected || length > 8U) return;
-  String command;
-  for (unsigned int i = 0; i < length; ++i) command += static_cast<char>(payload[i]);
+  if (receivedTopic != expected || (!signingProtocolActive() && length > 8U)) return;
+  String command = signingProtocolActive()
+      ? (commandBody.indexOf("\"state\":\"on\"") >= 0 ? "on" :
+         commandBody.indexOf("\"state\":\"off\"") >= 0 ? "off" : String())
+      : commandBody;
   command.trim(); command.toLowerCase();
   if (command != "on" && command != "off") {
-    const String destination = topic("ack/relay");
-    mqttClient.publish(destination.c_str(), "{\"accepted\":false,\"error\":\"invalid_state\"}", false);
+    publishMessage("ack/relay", "{\"accepted\":false,\"error\":\"invalid_state\"}", false);
     return;
   }
   if (!relayActuationAllowed_ || relayCommandPending_) {
-    const String destination = topic("ack/relay");
-    mqttClient.publish(destination.c_str(), "{\"accepted\":false,\"error\":\"relay_unavailable\"}", false);
+    publishMessage("ack/relay", "{\"accepted\":false,\"error\":\"relay_unavailable\"}", false);
     return;
   }
   requestedRelayOn_ = command == "on";
@@ -791,14 +1274,20 @@ bool SmartPlugMqtt::takeEnergySync(double& energyWh, bool& reset) {
   return true;
 }
 
+bool SmartPlugMqtt::takeBootSnapshot(double& energyWh) {
+  if (!bootSnapshotPending_) return false;
+  bootSnapshotPending_ = false;
+  energyWh = bootSnapshotEnergyWh_;
+  return true;
+}
+
 void SmartPlugMqtt::reportRelayCommandResult(const bool turnOn,
                                               const bool accepted) {
   if (!mqttClient.connected()) return;
-  const String destination = topic("ack/relay");
   const String body = String("{\"accepted\":") +
                       (accepted ? "true" : "false") + ",\"state\":\"" +
                       (turnOn ? "on" : "off") + "\"}";
-  mqttClient.publish(destination.c_str(), body.c_str(), false);
+  publishMessage("ack/relay", body, false);
 }
 
 void SmartPlugMqtt::setMeterSnapshot(
@@ -832,13 +1321,21 @@ void SmartPlugMqtt::tick() {
   }
   connectIfNeeded();
   if (!mqttClient.connected()) return;
-  mqttClient.loop();
-  if (relayState_ != lastPublishedRelayState_) publishState(true);
   const unsigned long now = millis();
+  // PubSubClient can retain a stale TCP socket for tens of seconds after the
+  // ESP32 broker restarts. Once heartbeat capability is observed, a missing
+  // heartbeat is authoritative enough to close that stale socket and reconnect.
+  if (brokerHeartbeatObserved_ &&
+      now - lastBrokerHeartbeatAtMs_ > kBrokerHeartbeatTimeoutMs) {
+    mqttClient.disconnect();
+    Serial.println(F("WARN mqtt_broker_heartbeat_lost"));
+    return;
+  }
+  if (!mqttClient.loop()) return;
+  if (relayState_ != lastPublishedRelayState_) publishState(true);
   if (smartplug_reliability::fresh(hasSample_, now, capturedAtMs_) &&
       (lastTelemetryAtMs_ == 0 || now - lastTelemetryAtMs_ >= kTelemetryIntervalMs)) {
     lastTelemetryAtMs_ = now;
-    publishTelemetry();
     publishMeasurements();
   }
 }
@@ -1008,6 +1505,12 @@ constexpr unsigned long kSessionLifetimeMs = 15UL * 60UL * 1000UL;
 constexpr unsigned long kLoginLockoutMs = 60UL * 1000UL;
 constexpr unsigned long kMutationMinimumMs = 250UL;
 constexpr unsigned long kRelayMinimumMs = 1000UL;
+// An expired timer must not disappear merely because a relay command was
+// rejected during cooldown or a zero-cross edge was unavailable.  Retrying
+// more often than the relay cooldown has no value, while an unbounded loop
+// would conceal a persistent hardware/supply fault.
+constexpr unsigned long kTimerExpiryRetryMs = 1000UL;
+constexpr uint8_t kTimerExpiryMaxAttempts = 3U;
 constexpr uint8_t kMaxFailedLogins = 5;
 // design.md: "pairing_token ... berlaku lima menit".
 constexpr unsigned long kPairingTokenLifetimeMs = 5UL * 60UL * 1000UL;
@@ -1166,6 +1669,7 @@ struct PersistentSettings {
   DailyScheduleEntry schedules[kMaxDailySchedules];
   char scheduleEventLabels[kScheduleEventPoolBytes];
 };
+
 
 // R3.9.0 persisted the user-selectable LittleFS setting. Keep the layout only
 // to migrate existing access and calibration settings to version 7/8.
@@ -1553,6 +2057,140 @@ String SmartPlugApi::randomHex(const size_t bytes) const {
   return token;
 }
 
+// Credential vault is independent of the tightly packed EEPROM settings
+// record. Two LittleFS slots retain the last valid set of per-phone
+// verifiers; the old EEPROM verifier remains a deliberate migration fallback.
+namespace credential_vault {
+using smartplug_credentials::Credential;
+using smartplug_credentials::Record;
+using smartplug_credentials::Role;
+constexpr const char* kSlots[] = {"/credentials-a.dat", "/credentials-b.dat"};
+bool ready = false;
+bool corrupt = false;
+int activeSlot = -1;
+uint32_t sequence = 0U;
+uint8_t count = 0U;
+Credential credentials[smartplug_credentials::kMaxCredentials] = {};
+
+bool readSlot(const int slot, Record& record, uint32_t& slotSequence,
+              Credential* slotCredentials, uint8_t& slotCount) {
+  File file = LittleFS.open(kSlots[slot], "r");
+  if (!file || file.size() != sizeof(record)) return false;
+  const bool read = file.read(record.bytes, sizeof(record)) == sizeof(record);
+  file.close();
+  return read && smartplug_credentials::decode(record, slotSequence,
+                                               slotCredentials, slotCount);
+}
+
+bool save(const Credential* nextCredentials, const uint8_t nextCount) {
+  if (!ready || nextCount == 0U || nextCount > smartplug_credentials::kMaxCredentials) return false;
+  const int target = activeSlot == 0 ? 1 : 0;
+  const Record record = smartplug_credentials::makeRecord(sequence + 1U,
+                                                            nextCredentials, nextCount);
+  File file = LittleFS.open(kSlots[target], "w");
+  if (!file) return false;
+  const bool written = file.write(record.bytes, sizeof(record)) == sizeof(record);
+  file.flush();
+  file.close();
+  Record verified = {};
+  Credential verifiedCredentials[smartplug_credentials::kMaxCredentials] = {};
+  uint32_t verifiedSequence = 0U;
+  uint8_t verifiedCount = 0U;
+  const bool valid = written && readSlot(target, verified, verifiedSequence,
+                                         verifiedCredentials, verifiedCount) &&
+      verifiedSequence == sequence + 1U && verifiedCount == nextCount;
+  if (!valid) return false;
+  activeSlot = target;
+  sequence = verifiedSequence;
+  count = verifiedCount;
+  memcpy(credentials, verifiedCredentials, sizeof(credentials));
+  corrupt = false;
+  return true;
+}
+
+bool initialize() {
+  ready = LittleFS.begin();
+  activeSlot = -1;
+  sequence = 0U;
+  count = 0U;
+  for (Credential& credential : credentials) credential = Credential{};
+  if (!ready) return false;
+  Record a = {}, b = {};
+  Credential ca[smartplug_credentials::kMaxCredentials] = {};
+  Credential cb[smartplug_credentials::kMaxCredentials] = {};
+  uint32_t sa = 0U, sb = 0U;
+  uint8_t na = 0U, nb = 0U;
+  const bool validA = readSlot(0, a, sa, ca, na);
+  const bool validB = readSlot(1, b, sb, cb, nb);
+  corrupt = (LittleFS.exists(kSlots[0]) && !validA) ||
+            (LittleFS.exists(kSlots[1]) && !validB);
+  activeSlot = smartplug_credentials::newestSlot(validA, sa, validB, sb);
+  if (activeSlot >= 0) {
+    sequence = activeSlot == 0 ? sa : sb;
+    count = activeSlot == 0 ? na : nb;
+    memcpy(credentials, activeSlot == 0 ? ca : cb, sizeof(credentials));
+  }
+  return true;
+}
+
+bool migrateLegacyOwner() {
+  if (!ready || count != 0U || persistentSettings.ownerTokenHash[0] == '\0') return ready;
+  Credential legacy = {};
+  memcpy(legacy.id, "owner-legacy", sizeof("owner-legacy"));
+  legacy.role = Role::owner;
+  memcpy(legacy.salt, persistentSettings.ownerTokenSalt, sizeof(legacy.salt));
+  memcpy(legacy.verifier, persistentSettings.ownerTokenHash, sizeof(legacy.verifier));
+  return save(&legacy, 1U);
+}
+
+Role authorize(const String& token) {
+  if (!ready || token.isEmpty()) return Role::none;
+  for (uint8_t index = 0U; index < count; ++index) {
+    const Credential& candidate = credentials[index];
+    if (constantTimeEquals(sha256Hmac(token, String(candidate.salt)),
+                           String(candidate.verifier))) return candidate.role;
+  }
+  return Role::none;
+}
+
+bool clear() {
+  bool ok = true;
+  if (ready) {
+    for (const char* path : kSlots) {
+      if (LittleFS.exists(path) && !LittleFS.remove(path)) ok = false;
+    }
+  }
+  ready = false;
+  corrupt = false;
+  activeSlot = -1;
+  sequence = 0U;
+  count = 0U;
+  for (Credential& credential : credentials) credential = Credential{};
+  return ok;
+}
+
+bool add(const Credential& credential) {
+  if (!ready || count >= smartplug_credentials::kMaxCredentials ||
+      !smartplug_credentials::validCredential(credential) ||
+      smartplug_credentials::findCredential(credentials, count, credential.id) >= 0) return false;
+  Credential next[smartplug_credentials::kMaxCredentials] = {};
+  memcpy(next, credentials, sizeof(next));
+  next[count] = credential;
+  return save(next, static_cast<uint8_t>(count + 1U));
+}
+
+bool removeMember(const char* credentialId) {
+  const int index = smartplug_credentials::findCredential(credentials, count, credentialId);
+  if (!ready || index < 0 || credentials[index].role != Role::member) return false;
+  Credential next[smartplug_credentials::kMaxCredentials] = {};
+  uint8_t nextCount = 0U;
+  for (uint8_t source = 0U; source < count; ++source) {
+    if (source != static_cast<uint8_t>(index)) next[nextCount++] = credentials[source];
+  }
+  return save(next, nextCount);
+}
+}  // namespace credential_vault
+
 bool SmartPlugApi::validateText(const String& value, const size_t minLength,
                                  const size_t maxLength,
                                  const bool allowSpaces) const {
@@ -1574,7 +2212,17 @@ void SmartPlugApi::applyFactoryDefaults(const bool preserveCalibration, const bo
   // design.md: unit_id is generated once at first boot and stays permanent
   // across factory resets/ownership changes, unlike the AP password a user
   // can still rotate later from Access Point settings before pairing.
-  const String unitId = previous.unitId[0] != '\0' ? String(previous.unitId) : generateUnitId();
+  // A raw-erased EEPROM contains 0xFF, not '\0'.  Never turn an unvalidated
+  // byte array into a String: that used to produce a malformed "SP-<garbage>"
+  // SSID, make softAP() fail, and leave only the ESP8266 default AP visible.
+  // Only a checksum-valid current record may contribute its stable unit ID
+  // during an owner/factory reset; a fresh device always gets a new one.
+  const bool previousRecordValid =
+      previous.magic == kSettingsMagic &&
+      previous.version == kSettingsVersion &&
+      previous.crc == settingsCrc(previous) &&
+      strnlen(previous.unitId, sizeof(previous.unitId)) == 8;
+  const String unitId = previousRecordValid ? String(previous.unitId) : generateUnitId();
   copyText(persistentSettings.unitId, sizeof(persistentSettings.unitId), unitId);
   // Retail builds restore the issued per-unit label. Compatibility builds
   // adopt design.md's pairing AP identity so the Android app's "SP-<unit_id>"
@@ -1825,6 +2473,10 @@ void SmartPlugApi::startNetwork() {
   WiFi.mode(WIFI_OFF);
   delay(50);
   WiFi.mode(stationConfigured_ ? WIFI_AP_STA : WIFI_AP);
+  // ESP8266 needs a short radio-state settle after WIFI_OFF.  Without it this
+  // ESP-07 can reject softAP() immediately after a factory erase, leaving the
+  // onboarding AP invisible even though the HTTP commissioning code is ready.
+  delay(100);
   if (!WiFi.softAPConfig(apIp, apIp, subnet)) {
     Serial.println(F("ERR local_access_point_config_failed"));
   }
@@ -1879,6 +2531,14 @@ void SmartPlugApi::begin() {
   server_.on("/api/v1/schedule", HTTP_GET, [this]() { handleSchedule(); });
   server_.on("/api/v1/schedule", HTTP_POST, [this]() { handleSchedule(); });
   server_.on("/api/v1/settings/access", HTTP_POST, [this]() { handleAccessSettings(); });
+  server_.on("/api/v1/settings/display-name", HTTP_POST,
+             [this]() { handleDisplayName(); });
+  server_.on("/api/v1/access/profile", HTTP_GET, [this]() { handleAccessProfile(); });
+  server_.on("/api/v1/access/invitations", HTTP_POST, [this]() { handleAccessInvitation(); });
+  server_.on("/api/v1/access/enroll", HTTP_POST, [this]() { handleAccessEnroll(); });
+  server_.on("/api/v1/access/credentials", HTTP_GET, [this]() { handleAccessCredentials(); });
+  server_.on("/api/v1/access/credentials", HTTP_DELETE,
+             [this]() { handleAccessCredentialDelete(); });
   server_.on("/api/v1/relay", HTTP_POST, [this]() { handleRelayCommand(); });
   server_.on("/api/v1/audit", HTTP_GET, [this]() { handleAuditLog(); });
   server_.on("/api/v1/pair/info", HTTP_GET, [this]() { handlePairInfo(); });
@@ -1931,6 +2591,12 @@ void SmartPlugApi::printWebDiagnostics() {
   Serial.println(F("}"));
 }
 void SmartPlugApi::sendJson(const int code, const String& body) {
+  // Reuse the Android client's HTTP/1.1 socket. Creating a fresh TCP socket
+  // for every status and measurement poll can exhaust ESP8266's small TCP
+  // pool temporarily, even while Wi-Fi and ICMP remain healthy. The bundled
+  // ESP8266WebServer library owns the client lifecycle and drops it as soon as
+  // the peer disconnects; a pending second client still disables keep-alive.
+  server_.keepAlive(true);
   server_.sendHeader("Cache-Control", "no-store");
   server_.send(code, "application/json", body);
 }
@@ -1982,15 +2648,6 @@ String SmartPlugApi::calibrationState() const {
       valid(runtimeCalibration_.wattHoursPerCf);
   return count == 4 ? "calibrated" : (count ? "partial" : "not_calibrated");
 }
-void SmartPlugApi::handleDashboard() {
-  sendError(404, "dashboard_removed");
-}
-void SmartPlugApi::handleRawStatsScript() {
-  sendError(404, "dashboard_extension_removed");
-}
-void SmartPlugApi::handleDashboardVersionScript() {
-  sendError(404, "dashboard_extension_removed");
-}
 void SmartPlugApi::handleDiscovery() {
   sendJson(200, "{\"service\":\"SmartPlug local API\",\"version\":\"v1\",\"endpoints\":[\"/api/v1/capabilities\",\"/api/v1/status\",\"/api/v1/measurements/allparameters\",\"/api/v1/measurements/voltage\",\"/api/v1/measurements/current\",\"/api/v1/measurements/active-power\",\"/api/v1/measurements/apparent-power\",\"/api/v1/measurements/power-factor\",\"/api/v1/measurements/energy\",\"/api/v1/health\",\"/api/v1/auth/login\",\"/api/v1/relay\"]}");
 }
@@ -2011,6 +2668,7 @@ void SmartPlugApi::handleCapabilities() {
   sendJson(200, b);
 }
 void SmartPlugApi::handleStatus() {
+  if (!requireOperationalRead()) return;
   const bool connected = WiFi.status() == WL_CONNECTED;
   const char* firmwareVersion = build_config::kFirmwareVersion;
   String b(F("{\"firmware\":{\"name\":\"smartplug-bringup\",\"version\":\""));
@@ -2061,6 +2719,7 @@ void SmartPlugApi::handleStatus() {
   // is unaffected.
   b += ",\"api_version\":\"1.0\",\"relay_state\":\""; b += relayState_;
   b += "\",\"relay_actuation\":"; b += relayActuationAllowed_ ? "true" : "false";
+  b += ",\"relay_command_result\":\""; b += relayCommandResult_; b += "\"";
   b += ",\"wifi_connected\":"; b += connected ? "true" : "false";
   b += ",\"has_sample\":"; b += hasSample_ ? "true" : "false";
   b += ",\"fresh\":";
@@ -2105,6 +2764,7 @@ void SmartPlugApi::restorePersistedTimer() {
   }
 }
 void SmartPlugApi::handleLatestMeasurement() {
+  if (!requireOperationalRead()) return;
   const bool voltageReady = runtimeCalibration_.voltsPerCode > 0.0F;
   const bool currentReady = runtimeCalibration_.ampsPerCode > 0.0F;
   const bool powerReady = runtimeCalibration_.wattsPerCode > 0.0F;
@@ -2133,6 +2793,7 @@ void SmartPlugApi::handleLatestMeasurement() {
   sendJson(200, body);
 }
 void SmartPlugApi::handleMeasurementParameter(const char* parameter) {
+  if (!requireOperationalRead()) return;
   const bool voltageReady = runtimeCalibration_.voltsPerCode > 0.0F;
   const bool currentReady = runtimeCalibration_.ampsPerCode > 0.0F;
   const bool powerReady = runtimeCalibration_.wattsPerCode > 0.0F;
@@ -2154,7 +2815,7 @@ void SmartPlugApi::handleMeasurementParameter(const char* parameter) {
       ",\"unit\":\"" + unit + "\",\"calibration\":\"" + calibrationState() + "\"}";
   sendJson(200, body);
 }
-void SmartPlugApi::handleHealth() { const bool readerActive = hasSample_ && millis() - capturedAtMs_ <= 5000UL; String b = "{\"meter\":{\"reader_state\":\""; b += readerActive ? "active" : (hasPollResult_ ? "not_receiving_valid_data" : "awaiting_first_packet"); b += "\",\"last_valid_sample_age_ms\":"; b += hasSample_ ? String(millis() - capturedAtMs_) : "null"; b += ",\"has_poll_result\":"; b += hasPollResult_ ? "true" : "false"; b += ",\"latest_poll_valid\":"; b += hasPollResult_ ? (latestPollValid_ ? "true" : "false") : "null"; b += ",\"packets_ok\":" + String(packetsOk_) + ",\"packets_bad\":" + String(packetsBad_) + "},\"api\":\"ok\"}"; sendJson(200, b); }
+void SmartPlugApi::handleHealth() { if (!requireOperationalRead()) return; const bool readerActive = hasSample_ && millis() - capturedAtMs_ <= 5000UL; String b = "{\"meter\":{\"reader_state\":\""; b += readerActive ? "active" : (hasPollResult_ ? "not_receiving_valid_data" : "awaiting_first_packet"); b += "\",\"last_valid_sample_age_ms\":"; b += hasSample_ ? String(millis() - capturedAtMs_) : "null"; b += ",\"has_poll_result\":"; b += hasPollResult_ ? "true" : "false"; b += ",\"latest_poll_valid\":"; b += hasPollResult_ ? (latestPollValid_ ? "true" : "false") : "null"; b += ",\"packets_ok\":" + String(packetsOk_) + ",\"packets_bad\":" + String(packetsBad_) + "},\"api\":\"ok\"}"; sendJson(200, b); }
 void SmartPlugApi::handleLogin() {
   if (loginLockUntilMs_ != 0 && !reached(loginLockUntilMs_)) {
     sendError(429, "login_temporarily_locked"); return;
@@ -2213,6 +2874,16 @@ void SmartPlugApi::handleWifiSettings() {
   sendJson(200, String("{\"result\":\"saved_connecting\",\"ssid\":\"") + jsonEscape(ssid) + "\"}");
 }
 bool SmartPlugApi::factoryResetWifi() {
+  // Clear credential files before the general filesystem reset. Do not report
+  // a completed factory reset while a known credential record remains.
+  if (!credential_vault::clear()) return false;
+  // The household label is device-owned configuration, so it must not cross a
+  // factory-reset ownership boundary.
+  if (LittleFS.exists("/display-name.txt") && !LittleFS.remove("/display-name.txt")) return false;
+  LittleFS.remove("/display-name.tmp");
+#if SMARTPLUG_ENABLE_MQTT
+  if (mqtt_ != nullptr && !mqtt_->clearSigningMaterial()) return false;
+#endif
   if (!energy_persist::resetForFactory()) return false;
   clearSession();
   addAuditEvent("factory_reset");
@@ -2260,14 +2931,22 @@ void SmartPlugApi::handleEnergyReset() {
 }
 void SmartPlugApi::handleTimer() {
   if (server_.method() == HTTP_GET) { handleStatus(); return; }
-  const bool viaOwnerToken = requireOwnerTokenBearer();
-  if (!viaOwnerToken && !requireSession(true)) return;
+  const bool viaCredential = requireOperationalTokenBearer();
+  if (!viaCredential && !requireSession(true)) return;
   if (!validateMutationRate(kMutationMinimumMs)) return;
+  // In MQTT/Server mode the ESP32 is the sole automation authority.  Do not
+  // accept a stale direct-app timer request and create two independent OFF
+  // deadlines for the same relay.
+  if (!localAutomationAllowed()) { sendError(409, "automation_requires_direct_mode"); return; }
   const String action = server_.arg("action");
   if (action == "reset") {
     if (!timer_persist::save(0U, 0U)) { sendError(500, "timer_save_failed"); return; }
     timerDeadlineUtc_ = 0U;
     timerArmedSeconds_ = 0U;
+    timerExpiryCommandInFlight_ = false;
+    timerExpiryTerminalFailure_ = false;
+    timerExpiryAttempts_ = 0U;
+    timerExpiryRetryAtMs_ = 0UL;
     addAuditEvent("timer_reset"); sendJson(200, "{\"result\":\"timer_reset\"}"); return;
   }
   const uint32_t days = server_.arg("days").toInt();
@@ -2286,9 +2965,64 @@ void SmartPlugApi::handleTimer() {
     timerArmedSeconds_ = static_cast<uint32_t>(totalSeconds);
   }
   if (!timer_persist::save(timerDeadlineUtc_, timerArmedSeconds_)) { sendError(500, "timer_save_failed"); return; }
+  timerExpiryCommandInFlight_ = false;
+  timerExpiryTerminalFailure_ = false;
+  timerExpiryAttempts_ = 0U;
+  timerExpiryRetryAtMs_ = 0UL;
   addAuditEvent("timer_applied");
   sendJson(200, String("{\"result\":\"timer_applied\",\"running\":") +
                   (timerDeadlineUtc_ ? "true" : "false") + "}");
+}
+
+bool SmartPlugApi::localAutomationAllowed() const {
+#if SMARTPLUG_ENABLE_MQTT
+  // `mqttMode()` is persisted independently from the Direct schedule/timer
+  // records.  It is therefore the fail-closed authority bit during a handoff:
+  // a partially erased legacy record can never regain control of the relay.
+  return mqtt_ == nullptr || !mqtt_->mqttMode();
+#else
+  return true;
+#endif
+}
+
+bool SmartPlugApi::clearLocalAutomationForServerTransition() {
+  // Clear schedule and timer state before the MQTT profile is committed.  The
+  // order is intentional: a reset or power loss can at worst leave Direct
+  // automation cleared, never leave MQTT mode with a still-active Direct
+  // automation.  Do not touch relay state here; authority transition must not
+  // create an unexpected ON/OFF pulse.
+  const PersistentSettings previousSettings = persistentSettings;
+  const uint32_t previousDeadline = timerDeadlineUtc_;
+  const uint32_t previousArmed = timerArmedSeconds_;
+  persistentSettings.scheduleEnabled = 0U;
+  persistentSettings.scheduleCount = 0U;
+  memset(persistentSettings.schedules, 0, sizeof(persistentSettings.schedules));
+  memset(persistentSettings.scheduleEventLabels, 0,
+         sizeof(persistentSettings.scheduleEventLabels));
+  if (!saveSettings()) {
+    persistentSettings = previousSettings;
+    EEPROM.put(0, previousSettings);
+    return false;
+  }
+  if (!timer_persist::save(0U, 0U)) {
+    // Best-effort rollback preserves existing Direct automation when the
+    // destination mode was not committed.  If power is lost before this
+    // rollback, the safe deterministic state is Direct with no schedules.
+    persistentSettings = previousSettings;
+    saveSettings();
+    timerDeadlineUtc_ = previousDeadline;
+    timerArmedSeconds_ = previousArmed;
+    return false;
+  }
+  timerDeadlineUtc_ = 0U;
+  timerArmedSeconds_ = 0U;
+  timerExpiryCommandInFlight_ = false;
+  timerExpiryTerminalFailure_ = false;
+  timerExpiryAttempts_ = 0U;
+  timerExpiryRetryAtMs_ = 0UL;
+  lastScheduleMinute_ = -1;
+  addAuditEvent("local_automation_cleared_for_server");
+  return true;
 }
 
 String SmartPlugApi::scheduleJson() const {
@@ -2334,12 +3068,21 @@ String SmartPlugApi::scheduleJson() const {
 }
 
 void SmartPlugApi::handleSchedule() {
-  if (!requireOwnerTokenBearer()) return;
+  // Preserve the existing browser commissioning flow while allowing the
+  // Android app's owner/member bearer credential.  Requiring only a bearer
+  // here accidentally made the Schedule page unusable after authenticated
+  // operational reads were introduced.
+  const bool viaCredential = requireOperationalTokenBearer();
+  const bool requiresCsrf = server_.method() != HTTP_GET;
+  if (!viaCredential && !requireSession(requiresCsrf)) return;
   if (server_.method() == HTTP_GET) {
     sendJson(200, scheduleJson());
     return;
   }
   if (!validateMutationRate(kMutationMinimumMs)) return;
+  // See handleTimer(): once ServerSmartPlug owns the relay automation, all
+  // mutations must be made through its REST API instead of local LittleFS.
+  if (!localAutomationAllowed()) { sendError(409, "automation_requires_direct_mode"); return; }
   const String action = server_.arg("action");
   if (server_.hasArg("timezone_offset_minutes")) {
     const long offset = server_.arg("timezone_offset_minutes").toInt();
@@ -2399,6 +3142,10 @@ bool SmartPlugApi::takeEnergyReset() {
   return true;
 }
 bool SmartPlugApi::takeTimerOff() {
+  // A persisted pre-server deadline is never permitted to fire after MQTT
+  // mode becomes active, even if an interrupted migration left an old timer
+  // slot behind.  The successful mode transition clears it durably as well.
+  if (!localAutomationAllowed()) return false;
   if (timerDeadlineUtc_ == 0U && timerArmedSeconds_ == 0U) return false;
   const time_t now = time(nullptr);
   if (timerDeadlineUtc_ == 0U) {
@@ -2411,23 +3158,62 @@ bool SmartPlugApi::takeTimerOff() {
         timerArmedSeconds_ = previousArmedSeconds;
         return false;
       }
+      timerExpiryCommandInFlight_ = false;
+      timerExpiryTerminalFailure_ = false;
+      timerExpiryAttempts_ = 0U;
+      timerExpiryRetryAtMs_ = 0UL;
       addAuditEvent("timer_started");
     }
     return false;
   }
-  if (strcmp(relayState_, "on") != 0) return false;
   if (now < 1700000000 || static_cast<uint32_t>(now) < timerDeadlineUtc_) return false;
-  const uint32_t previousDeadline = timerDeadlineUtc_;
-  timerDeadlineUtc_ = 0U;
-  if (!timer_persist::save(timerDeadlineUtc_, timerArmedSeconds_)) {
-    timerDeadlineUtc_ = previousDeadline;
+
+  // The durable deadline is intentionally kept until the commanded relay
+  // state reports OFF.  Clearing it when a pulse is merely queued loses an
+  // expiry after a zero-cross timeout, cooldown rejection, or power loss.
+  if (strcmp(relayState_, "off") == 0) {
+    if (!timer_persist::save(0U, 0U)) {
+      relayCommandResult_ = "timer_expiry_persist_failed";
+      return false;
+    }
+    timerDeadlineUtc_ = 0U;
+    timerArmedSeconds_ = 0U;
+    timerExpiryCommandInFlight_ = false;
+    timerExpiryTerminalFailure_ = false;
+    timerExpiryAttempts_ = 0U;
+    timerExpiryRetryAtMs_ = 0UL;
+    addAuditEvent("timer_elapsed");
     return false;
   }
-  addAuditEvent("timer_elapsed");
+
+  if (strcmp(relayState_, "on") != 0 || timerExpiryCommandInFlight_ ||
+      timerExpiryTerminalFailure_ || !reached(timerExpiryRetryAtMs_)) {
+    return false;
+  }
+
+  timerExpiryCommandInFlight_ = true;
+  ++timerExpiryAttempts_;
   return true;
 }
 
+void SmartPlugApi::reportTimerOffRequestResult(const bool accepted) {
+  if (accepted) {
+    relayCommandResult_ = "pulsing";
+    return;
+  }
+  timerExpiryCommandInFlight_ = false;
+  if (timerExpiryAttempts_ >= kTimerExpiryMaxAttempts) {
+    timerExpiryTerminalFailure_ = true;
+    relayCommandResult_ = "timer_expiry_relay_failed";
+    addAuditEvent("timer_expiry_failed");
+    return;
+  }
+  timerExpiryRetryAtMs_ = millis() + kTimerExpiryRetryMs;
+  relayCommandResult_ = "timer_expiry_retrying";
+}
+
 bool SmartPlugApi::takeScheduledRelayCommand(bool& turnOn) {
+  if (!localAutomationAllowed()) return false;
   if (!persistentSettings.scheduleEnabled || persistentSettings.scheduleCount == 0U) return false;
   const time_t now = time(nullptr);
   if (now < 1700000000) return false;
@@ -2535,6 +3321,174 @@ void SmartPlugApi::handleAccessSettings() {
   sendJson(200, "{\"result\":\"access_settings_saved_rebooting\"}");
   delay(250); ESP.restart();
 }
+void SmartPlugApi::handleAccessProfile() {
+  if (!requireOperationalRead()) return;
+  sendJson(200, accessProfileJson());
+}
+void SmartPlugApi::handleDisplayName() {
+  // A label is safe to expose through the member profile, but only the owner
+  // credential may mutate it. It never contains a token or Wi-Fi secret.
+  if (!requireOwnerRole() || !validateMutationRate(kMutationMinimumMs)) return;
+  const String name = server_.arg("display_name");
+  if (!validateText(name, 1, 32, true)) { sendError(400, "invalid_display_name"); return; }
+  File temporary = LittleFS.open("/display-name.tmp", "w");
+  if (!temporary || temporary.print(name) != name.length()) {
+    if (temporary) temporary.close();
+    LittleFS.remove("/display-name.tmp");
+    sendError(500, "display_name_write_failed"); return;
+  }
+  temporary.close();
+  // LittleFS rename replaces the destination atomically, so a power loss
+  // cannot leave the previous valid household label half-written.
+  if (!LittleFS.rename("/display-name.tmp", "/display-name.txt")) {
+    LittleFS.remove("/display-name.tmp");
+    sendError(500, "display_name_write_failed"); return;
+  }
+  addAuditEvent("display_name_changed");
+  sendJson(200, String(F("{\"display_name\":\"")) + jsonEscape(name) + F("\"}"));
+}
+String SmartPlugApi::accessProfileJson() const {
+  String body(F("{\"api_version\":\"1.1\",\"device_id\":\""));
+  body += deviceId();
+  body += F("\",\"integration_mode\":\"");
+#if SMARTPLUG_ENABLE_MQTT
+  body += (mqtt_ != nullptr && mqtt_->mqttMode()) ? "mqtt" : "rest";
+#else
+  body += "rest";
+#endif
+  // Close integration_mode exactly once before appending optional Server
+  // fields.  Closing it again below used to emit `server_port":1883"`,
+  // which made a member-enrolment response invalid JSON in MQTT mode.
+  body += '"';
+  // The server endpoint is operational metadata, not a broker password.  A
+  // secondary phone may use it to recognize that this is Server mode, while
+  // it still must register that ServerSmartPlug locally before monitoring it.
+#if SMARTPLUG_ENABLE_MQTT
+  if (mqtt_ != nullptr && mqtt_->mqttMode()) {
+    const SmartPlugMqtt::SettingsView settings = mqtt_->settingsView();
+    body += F(",\"server_host\":\""); body += jsonEscape(settings.host);
+    body += F("\",\"server_port\":"); body += String(settings.port);
+  }
+#endif
+  String displayName;
+  File displayNameFile = LittleFS.open("/display-name.txt", "r");
+  if (displayNameFile) {
+    displayName = displayNameFile.readString();
+    displayNameFile.close();
+    displayName.trim();
+  }
+  body += F(",\"display_name\":\"");
+  body += jsonEscape(displayName);
+  body += F("\",\"relay_state\":\""); body += relayState_;
+  const time_t timerNow = time(nullptr);
+  const bool timerClockReady = timerNow >= 1700000000;
+  const bool timerRunning = timerDeadlineUtc_ != 0U;
+  const bool timerActive = timerRunning || timerArmedSeconds_ != 0U;
+  const uint32_t timerRemainingSeconds = timerRunning && timerClockReady &&
+      timerDeadlineUtc_ > static_cast<uint32_t>(timerNow)
+      ? timerDeadlineUtc_ - static_cast<uint32_t>(timerNow)
+      : (timerRunning ? 0U : timerArmedSeconds_);
+  body += F("\",\"timer\":{\"active\":"); body += timerActive ? "true" : "false";
+  body += F(",\"running\":"); body += timerRunning ? "true" : "false";
+  body += F(",\"remaining_ms\":"); body += String(static_cast<uint64_t>(timerRemainingSeconds) * 1000ULL);
+  body += F("},\"schedule\":"); body += scheduleJson();
+  body += F("}");
+  return body;
+}
+bool SmartPlugApi::requireOwnerRole() { return requireOwnerTokenBearer(); }
+void SmartPlugApi::handleAccessInvitation() {
+  if (!requireOwnerRole()) return;
+  if (accessInviteLockUntilMs_ != 0U && !reached(accessInviteLockUntilMs_)) {
+    sendError(429, "access_invite_temporarily_locked"); return;
+  }
+  if (!accessInviteCode_.isEmpty() && !reached(accessInviteExpiresAtMs_)) {
+    sendError(409, "invite_already_active"); return;
+  }
+  // Retrofit uses JSON while the browser form uses URL-encoded arguments.
+  // Accept the same declared field from either representation.
+  const String requestBody = server_.hasArg("plain") ? server_.arg("plain") : String();
+  const String requestedRole = server_.hasArg("role")
+      ? server_.arg("role") : extractJsonString(requestBody, "role");
+  if (requestedRole != "member") { sendError(400, "invalid_access_role"); return; }
+  const uint32_t randomValue = ESP.random() % 1000000UL;
+  accessInviteCode_ = String(randomValue);
+  while (accessInviteCode_.length() < 6U) accessInviteCode_ = '0' + accessInviteCode_;
+  accessInviteExpiresAtMs_ = millis() + 5UL * 60UL * 1000UL;
+  accessInviteFailures_ = 0U;
+  addAuditEvent("access_invite_created");
+  sendJson(201, String("{\"api_version\":\"1.1\",\"invite_code\":\"") +
+                    accessInviteCode_ + "\",\"expires_in_s\":300}");
+}
+void SmartPlugApi::handleAccessEnroll() {
+  const IPAddress apIp = WiFi.softAPIP();
+  const IPAddress remoteIp = server_.client().remoteIP();
+  // Enrollment is LAN-only. A client currently connected through the setup AP
+  // must not be able to enroll simply by knowing its AP password.
+  if (remoteIp[0] == apIp[0] && remoteIp[1] == apIp[1] && remoteIp[2] == apIp[2]) {
+    sendError(401, "invalid_or_expired_invite"); return;
+  }
+  if (accessInviteLockUntilMs_ != 0U && !reached(accessInviteLockUntilMs_)) {
+    sendError(401, "invalid_or_expired_invite"); return;
+  }
+  if (accessInviteLockUntilMs_ != 0U) {
+    // A completed temporary lock starts a fresh five-attempt window. Without
+    // this reset, one later typo immediately recreated the lock forever.
+    accessInviteLockUntilMs_ = 0U;
+    accessInviteFailures_ = 0U;
+  }
+  const String body = server_.hasArg("plain") ? server_.arg("plain") : String();
+  const String requestedDeviceId = extractJsonString(body, "device_id");
+  const String inviteCode = extractJsonString(body, "invite_code");
+  const bool valid = !accessInviteCode_.isEmpty() && !reached(accessInviteExpiresAtMs_) &&
+      constantTimeEquals(requestedDeviceId, deviceId()) &&
+      constantTimeEquals(inviteCode, accessInviteCode_);
+  if (!valid) {
+    ++accessInviteFailures_;
+    if (accessInviteFailures_ >= 5U) accessInviteLockUntilMs_ = millis() + 60UL * 1000UL;
+    sendError(401, "invalid_or_expired_invite"); return;
+  }
+  const String credentialToken = randomHex(32);
+  const String credentialId = String("m-") + randomHex(4);
+  const String salt = randomHex(8);
+  smartplug_credentials::Credential credential = {};
+  credentialId.toCharArray(credential.id, sizeof(credential.id));
+  credential.role = smartplug_credentials::Role::member;
+  salt.toCharArray(credential.salt, sizeof(credential.salt));
+  sha256Hmac(credentialToken, salt).toCharArray(credential.verifier, sizeof(credential.verifier));
+  if (!credential_vault::add(credential)) {
+    sendError(409, "credential_limit_reached"); return;
+  }
+  accessInviteCode_ = String(); accessInviteExpiresAtMs_ = 0U; accessInviteFailures_ = 0U;
+  addAuditEvent("access_member_enrolled");
+  String response(F("{\"api_version\":\"1.1\",\"credential\":\""));
+  response += credentialToken; response += F("\",\"credential_id\":\"");
+  response += credentialId; response += F("\",\"role\":\"member\",\"profile\":");
+  response += accessProfileJson();
+  response += "}";
+  sendJson(201, response);
+}
+void SmartPlugApi::handleAccessCredentials() {
+  if (!requireOwnerRole()) return;
+  String body(F("{\"credentials\":["));
+  for (uint8_t index = 0U; index < credential_vault::count; ++index) {
+    if (index) body += ',';
+    const smartplug_credentials::Credential& credential = credential_vault::credentials[index];
+    body += String("{\"credential_id\":\"") + jsonEscape(credential.id) +
+        "\",\"role\":\"" +
+        (credential.role == smartplug_credentials::Role::owner ? "owner" : "member") + "\"}";
+  }
+  body += "]}"; sendJson(200, body);
+}
+void SmartPlugApi::handleAccessCredentialDelete() {
+  if (!requireOwnerRole()) return;
+  const String requestBody = server_.hasArg("plain") ? server_.arg("plain") : String();
+  const String credentialId = server_.hasArg("credential_id")
+      ? server_.arg("credential_id") : extractJsonString(requestBody, "credential_id");
+  if (!credential_vault::removeMember(credentialId.c_str())) {
+    sendError(404, "member_credential_not_found"); return;
+  }
+  addAuditEvent("access_member_revoked"); sendJson(200, "{\"result\":\"credential_revoked\"}");
+}
 #if SMARTPLUG_ENABLE_MQTT
 void SmartPlugApi::handleMqttSettings() {
   if (mqtt_ == nullptr) { sendError(503, "mqtt_unavailable"); return; }
@@ -2550,17 +3504,37 @@ void SmartPlugApi::handleMqttSettings() {
     body += F("\",\"port\":"); body += String(settings.port);
     body += F(",\"username\":\""); body += jsonEscape(settings.username);
     body += F("\",\"topic\":\""); body += jsonEscape(settings.baseTopic);
-    body += F("\",\"device_id\":\""); body += deviceId(); body += F("\"}");
+    body += F("\",\"protocol\":"); body += String(settings.protocol);
+    body += F(",\"signing_ready\":"); body += settings.signingReady ? "true" : "false";
+    body += F(",\"device_id\":\""); body += deviceId(); body += F("\"}");
     sendJson(200, body);
     return;
   }
-  if (!requireSession(true) || !validateMutationRate(kMutationMinimumMs)) return;
-  const String mode = server_.arg("mode");
-  const String host = server_.arg("host");
-  const String portText = server_.arg("port");
-  const String username = server_.arg("username");
-  const String password = server_.arg("password");
-  const String topic = server_.arg("topic");
+  // MQTT host/credentials decide where this SmartPlug publishes its data.
+  // Unlike daily telemetry and relay control, a household member must never
+  // be able to redirect the device to a different ServerSmartPlug.  Keep the
+  // browser administrator session as an owner-equivalent path, but require an
+  // owner bearer credential for the Android path.
+  const bool viaOwnerToken = requireOwnerTokenBearer();
+  if (!viaOwnerToken && !requireSession(true)) return;
+  if (!validateMutationRate(kMutationMinimumMs)) return;
+  const String requestBody = server_.hasArg("plain") ? server_.arg("plain") : String();
+  const auto requestField = [this, &requestBody](const char* key) {
+    return server_.hasArg(key) ? server_.arg(key) : extractJsonString(requestBody, key);
+  };
+  const String mode = requestField("mode");
+  const String host = requestField("host");
+  const String portText = requestField("port");
+  const String username = requestField("username");
+  const String password = requestField("password");
+  const String topic = requestField("topic");
+  const String protocolText = requestField("protocol");
+  const String signingSecret = requestField("signing_secret");
+  if (!protocolText.isEmpty() && protocolText != "1" && protocolText != "2") {
+    sendError(400, "invalid_mqtt_settings"); return;
+  }
+  const uint8_t protocol = protocolText == "2" ? 2U :
+      (protocolText == "1" ? 1U : 0U);
   uint32_t port = 0;
   for (size_t i = 0; i < portText.length(); ++i) {
     const char c = portText[i];
@@ -2568,25 +3542,43 @@ void SmartPlugApi::handleMqttSettings() {
     port = port * 10U + static_cast<uint32_t>(c - '0');
     if (port > 65535U) { sendError(400, "invalid_mqtt_port"); return; }
   }
+  const bool wasServerMode = mqtt_->mqttMode();
+  const bool requestingServerMode = mode == "mqtt";
+  // Returning to Direct is blocked until the local authority record is
+  // durably blank.  Otherwise an old timer/schedule could revive immediately
+  // after the REST profile was committed.
+  if (wasServerMode && !requestingServerMode &&
+      !clearLocalAutomationForServerTransition()) {
+    sendError(500, "automation_transition_clear_failed"); return;
+  }
   if (!mqtt_->saveWebSettings(mode, host, static_cast<uint16_t>(port),
-                                             username, password, topic)) {
+                              username, password, topic, protocol, signingSecret)) {
     sendError(400, "invalid_mqtt_settings"); return;
+  }
+  bool localAutomationCleared = true;
+  if (!wasServerMode && requestingServerMode) {
+    // The persisted MQTT mode immediately disables execution through
+    // localAutomationAllowed().  Erasure is then attempted as hygiene; a
+    // storage error cannot turn this into a misleading failed transition nor
+    // create a second authority while the server profile is live.
+    localAutomationCleared = clearLocalAutomationForServerTransition();
+    if (!localAutomationCleared) addAuditEvent("local_automation_disabled_for_server");
   }
   addAuditEvent("mqtt_settings_saved");
   sendJson(200, String("{\"result\":\"integration_settings_saved\",\"mode\":\"") +
                     mode + "\",\"configured\":" +
                     (mqtt_->configured() ? "true" : "false") +
                     ",\"connected\":" +
-                    (mqtt_->connected() ? "true" : "false") + "}");
+                    (mqtt_->connected() ? "true" : "false") +
+                    ",\"local_automation_cleared\":" +
+                    (localAutomationCleared ? "true" : "false") + "}");
 }
 #endif
 void SmartPlugApi::handleRelayCommand() {
-  // design.md's app drives this endpoint with `Authorization: Bearer
-  // <owner_token>` from pairing, not the admin session cookie; QC/admin
-  // tooling documented in firmware/LOCAL-API.md keeps using session+CSRF.
-  // Either is accepted; only one has to succeed.
-  const bool viaOwnerToken = requireOwnerTokenBearer();
-  if (!viaOwnerToken && !requireSession(true)) return;
+  // An enrolled household credential may control the relay; admin browser
+  // tooling keeps session+CSRF authorization.
+  const bool viaCredential = requireOperationalTokenBearer();
+  if (!viaCredential && !requireSession(true)) return;
   if (!validateMutationRate(kRelayMinimumMs)) return;
   String state = server_.arg("state");
   if (state.isEmpty() && server_.hasArg("plain")) {
@@ -2627,14 +3619,30 @@ bool SmartPlugApi::requirePairingToken() {
   return true;
 }
 bool SmartPlugApi::requireOwnerTokenBearer() {
-  if (persistentSettings.ownerTokenHash[0] == '\0') return false;
   const String authHeader = server_.header("Authorization");
   if (!authHeader.startsWith("Bearer ")) return false;
   const String token = authHeader.substring(7);
   if (token.isEmpty()) return false;
+  if (credential_vault::authorize(token) == smartplug_credentials::Role::owner) return true;
+  if (persistentSettings.ownerTokenHash[0] == '\0') return false;
   return constantTimeEquals(
       sha256Hmac(token, String(persistentSettings.ownerTokenSalt)),
       String(persistentSettings.ownerTokenHash));
+}
+bool SmartPlugApi::requireOperationalTokenBearer() {
+  const String authHeader = server_.header("Authorization");
+  if (!authHeader.startsWith("Bearer ")) return false;
+  const String token = authHeader.substring(7);
+  if (token.isEmpty()) return false;
+  if (credential_vault::authorize(token) != smartplug_credentials::Role::none) return true;
+  if (persistentSettings.ownerTokenHash[0] == '\0') return false;
+  return constantTimeEquals(
+      sha256Hmac(token, String(persistentSettings.ownerTokenSalt)),
+      String(persistentSettings.ownerTokenHash));
+}
+bool SmartPlugApi::requireOperationalRead() {
+  if (requireOperationalTokenBearer()) return true;
+  return requireSession(false);
 }
 String SmartPlugApi::pairFailedJson(const char* reason) const {
   return String("{\"api_version\":\"1.0\",\"state\":\"failed\",\"reason\":\"") + reason + "\"}";
@@ -2668,9 +3676,10 @@ void SmartPlugApi::handlePairScanWifi() {
   for (int i = 0; i < count; ++i) {
     const String ssid = WiFi.SSID(i);
     // Never offer another SmartPlug/ServerSmartPlug setup AP as a "home"
-    // network, design.md "SmartPlug yang memindai Wi-Fi... AP yang diawali
-    // SP- atau SrvrPlug- tidak ditampilkan sebagai pilihan Wi-Fi rumah".
-    if (ssid.isEmpty() || ssid.startsWith("SP-") || ssid.startsWith("SrvrPlug-")) continue;
+    // network.  Keep the historical SrvrPlug- prefix too for compatibility
+    // with older server builds.
+    if (ssid.isEmpty() || ssid.startsWith("SP-") || ssid.startsWith("SrvrPlug-") ||
+        ssid == "ServerSmartPlug-Setup") continue;
     if (emitted++) b += ',';
     b += "{\"ssid\":\""; b += jsonEscape(ssid);
     b += "\",\"rssi\":"; b += String(WiFi.RSSI(i));
@@ -2702,6 +3711,8 @@ void SmartPlugApi::handlePairConfigure() {
     const String mqttUsername = extractJsonString(body, "mqtt_username");
     const String mqttPassword = extractJsonString(body, "mqtt_password");
     const String baseTopic = extractJsonString(body, "base_topic");
+    const long mqttProtocol = extractJsonNumber(body, "protocol");
+    const String signingSecret = extractJsonString(body, "signing_secret");
     if (serverId.isEmpty() || brokerHost.isEmpty() || brokerPort <= 0 ||
         brokerPort > 65535 || baseTopic.isEmpty()) {
       sendError(400, "server_profile_invalid");
@@ -2709,7 +3720,9 @@ void SmartPlugApi::handlePairConfigure() {
     }
     if (mqtt_ == nullptr ||
         !mqtt_->saveWebSettings("mqtt", brokerHost, static_cast<uint16_t>(brokerPort),
-                                mqttUsername, mqttPassword, baseTopic)) {
+                                mqttUsername, mqttPassword, baseTopic,
+                                mqttProtocol < 0 ? 0U : static_cast<uint8_t>(mqttProtocol),
+                                signingSecret)) {
       sendError(400, "server_profile_invalid");
       return;
     }
@@ -2759,6 +3772,12 @@ void SmartPlugApi::handlePairStatus() {
       copyText(persistentSettings.ownerTokenHash, sizeof(persistentSettings.ownerTokenHash),
                sha256Hmac(token, salt));
       saveSettings();
+      // The EEPROM verifier is retained as an upgrade fallback. The vault is
+      // the future multi-phone source of truth; a failed migration never
+      // invalidates the owner token just issued by the existing pairing flow.
+      if (!credential_vault::migrateLegacyOwner()) {
+        Serial.println(F("WARN credential_vault_initial_migration_failed"));
+      }
       pairingIssuedOwnerToken_ = token;
       addAuditEvent("pairing_connected");
     }
@@ -2793,10 +3812,28 @@ void SmartPlugApi::setMeterSnapshot(const smartplug_bl0940::Measurement& raw,con
 void SmartPlugApi::setMeterHealth(bool hasPollResult,bool latestPollValid,uint32_t packetsOk,uint32_t packetsBad) { hasPollResult_=hasPollResult; latestPollValid_=latestPollValid; packetsOk_=packetsOk; packetsBad_=packetsBad; }
 void SmartPlugApi::setStandbyState(bool detected,bool pending) { standbyDetected_=detected; standbyPending_=pending; }
 void SmartPlugApi::setVoltageAnomaly(const char* state) { voltageAnomalyState_=state; }
-void SmartPlugApi::setRelayState(const char* relayState,bool actuationAllowed) {
+void SmartPlugApi::setRelayState(const char* relayState, bool actuationAllowed,
+                                 const bool zeroCrossTimedOut) {
   relayState_=relayState; relayActuationAllowed_=actuationAllowed;
-  if (relayCommandResult_ == "pulsing" && strcmp(relayState_, "transitioning") != 0)
+  if (timerExpiryCommandInFlight_ && zeroCrossTimedOut) {
+    // The queued OFF pulse never started, so leave the durable deadline in
+    // place and retry only a bounded number of times.  The terminal state is
+    // visible through relay_command_result; it is never misreported as an
+    // elapsed timer.
+    timerExpiryCommandInFlight_ = false;
+    if (timerExpiryAttempts_ >= kTimerExpiryMaxAttempts) {
+      timerExpiryTerminalFailure_ = true;
+      relayCommandResult_ = "timer_expiry_zero_cross_failed";
+      addAuditEvent("timer_expiry_failed");
+    } else {
+      timerExpiryRetryAtMs_ = millis() + kTimerExpiryRetryMs;
+      relayCommandResult_ = "timer_expiry_zero_cross_retrying";
+    }
+  } else if (zeroCrossTimedOut) {
+    relayCommandResult_ = "zero_cross_timeout";
+  } else if (relayCommandResult_ == "pulsing" && strcmp(relayState_, "transitioning") != 0) {
     relayCommandResult_ = "completed";
+  }
 }
 void SmartPlugApi::reportRelayCommandResult(bool accepted) {
   relayCommandResult_ = accepted ? "pulsing" : "rejected";
@@ -2906,6 +3943,91 @@ bool resetForFactory() {
 }  // namespace energy_persist
 // ===== END Energy Persistence (LittleFS) =====
 
+// ===== BEGIN Legacy 64 KiB -> 32 KiB LittleFS migration =====
+// The 1 KiB emulated EEPROM sector has current API settings at 0..511 and the
+// MQTT profile beginning at 512. MqttSettings is 244 bytes, so offset 768 is
+// a dedicated 256-byte tail. This handoff avoids writing any sector in the
+// legacy LittleFS volume before its energy value has been copied safely.
+#if SMARTPLUG_LEGACY_FS_MIGRATION_STAGE || SMARTPLUG_LITTLEFS_32K
+namespace fs_layout_migration {
+
+constexpr size_t kEepromOffset = kMigrationEepromOffset;
+using smartplug_migration::Phase;
+using smartplug_migration::Record;
+static_assert(kEepromOffset + sizeof(Record) <= 1024U,
+              "Migration handoff exceeds EEPROM buffer.");
+
+bool read(Record& record) {
+  EEPROM.get(kEepromOffset, record);
+  return smartplug_migration::valid(record);
+}
+
+bool write(Record record) {
+  if (!smartplug_migration::valid(record)) return false;
+  EEPROM.put(kEepromOffset, record);
+  if (!EEPROM.commit()) return false;
+  Record verified = {};
+  return read(verified) &&
+         smartplug_migration::phase(verified) == smartplug_migration::phase(record) &&
+         smartplug_migration::energySequence(verified) ==
+             smartplug_migration::energySequence(record) &&
+         smartplug_migration::energyWh(verified) ==
+             smartplug_migration::energyWh(record);
+}
+
+#if SMARTPLUG_LEGACY_FS_MIGRATION_STAGE
+bool prepare(const double energyWh, const uint32_t sequence) {
+  Record prior = {};
+  if (read(prior) && smartplug_migration::phase(prior) == Phase::kPrepared &&
+      smartplug_migration::energyWh(prior) >= energyWh) {
+    return true;
+  }
+  return write(smartplug_migration::makeRecord(Phase::kPrepared, sequence,
+                                                energyWh));
+}
+#endif
+
+#if SMARTPLUG_LITTLEFS_32K
+bool prepared(double& energyWh, uint32_t& sequence) {
+  Record record = {};
+  if (!read(record) || smartplug_migration::phase(record) != Phase::kPrepared) return false;
+  energyWh = smartplug_migration::energyWh(record);
+  sequence = smartplug_migration::energySequence(record);
+  return true;
+}
+
+bool markImported(const double energyWh, const uint32_t sequence) {
+  Record record = {};
+  if (!read(record) || smartplug_migration::phase(record) != Phase::kPrepared ||
+      smartplug_migration::energyWh(record) != energyWh ||
+      smartplug_migration::energySequence(record) != sequence) {
+    return false;
+  }
+  return write(smartplug_migration::makeRecord(Phase::kImported, sequence,
+                                                energyWh));
+}
+
+bool imported() {
+  Record record = {};
+  return read(record) && smartplug_migration::phase(record) == Phase::kImported;
+}
+
+bool clearImported() {
+  Record record = {};
+  if (!read(record) || smartplug_migration::phase(record) != Phase::kImported) return false;
+  const Record cleared = {};
+  EEPROM.put(kEepromOffset, cleared);
+  if (!EEPROM.commit()) return false;
+  Record verify = {};
+  EEPROM.get(kEepromOffset, verify);
+  return !smartplug_migration::valid(verify);
+}
+#endif
+
+}  // namespace fs_layout_migration
+#endif
+// ===== END Legacy 64 KiB -> 32 KiB LittleFS migration =====
+
 smartplug_bl0940::Driver meter(board_pins::kMeterRx, board_pins::kMeterTx);
 LatchingRelay relay(board_pins::kRelaySet, board_pins::kRelayReset,
                      build_config::kRelayPulseMs,
@@ -2945,6 +4067,10 @@ smartplug_reliability::BootRelayDecision relayBootDecision;
 #if SMARTPLUG_ENABLE_MQTT
 bool mqttRelayAwaitingCompletion = false;
 bool mqttRelayTargetOn = false;
+bool mqttEnergyRecoveryPending = false;
+bool mqttDeferredEnergyAvailable = false;
+double mqttDeferredLittleFsEnergyWh = 0.0;
+unsigned long mqttEnergyRecoveryDeadlineAt = 0;
 #endif
 char commandBuffer[kCommandCapacity] = {};
 std::size_t commandLength = 0;
@@ -3180,7 +4306,8 @@ void serviceLocalApi() {
       nextSaveSeconds);
   smartPlugApi.setMeterHealth(hasMeterPollResult, latestMeterPollValid,
                            meter.validPacketCount(), meter.invalidPacketCount());
-  smartPlugApi.setRelayState(relay.stateText(), relay.actuationAllowed());
+  smartPlugApi.setRelayState(relay.stateText(), relay.actuationAllowed(),
+                             relay.zeroCrossTimedOut());
   smartPlugApi.serviceRealtimeClock();
   smartPlugApi.handleClient();
   smartplug_metering::Calibration replacement = {};
@@ -3203,7 +4330,7 @@ void serviceLocalApi() {
   }
   if (smartPlugApi.takeTimerOff()) {
     const bool accepted = relay.requestOff();
-    smartPlugApi.reportRelayCommandResult(accepted);
+    smartPlugApi.reportTimerOffRequestResult(accepted);
     Serial.println(accepted ? F("INFO timer_relay_off") : F("WARN timer_relay_off_rejected"));
   }
   bool scheduledRelayOn = false;
@@ -3235,6 +4362,31 @@ void serviceMqtt() {
     mqttRelayAwaitingCompletion = false;
   }
   smartPlugMqtt.tick();
+  if (mqttEnergyRecoveryPending) {
+    double snapshotEnergyWh = 0.0;
+    if (smartPlugMqtt.takeBootSnapshot(snapshotEnergyWh)) {
+      // The requested boot snapshot is energy recovery only.  Its relay_state
+      // is intentionally not connected to any relay command path.
+      energyIntegrator.restoreEnergyWh(snapshotEnergyWh);
+      mqttEnergyRecoveryPending = false;
+      Serial.print(F("INFO mqtt_boot_snapshot_wh="));
+      Serial.println(snapshotEnergyWh, 3);
+    } else if (millis() >= mqttEnergyRecoveryDeadlineAt) {
+      if (mqttDeferredEnergyAvailable) {
+        energyIntegrator.restoreEnergyWh(mqttDeferredLittleFsEnergyWh);
+        Serial.print(F("INFO mqtt_boot_littlefs_fallback_wh="));
+        Serial.println(mqttDeferredLittleFsEnergyWh, 3);
+      } else {
+        Serial.println(F("INFO mqtt_boot_no_energy_fallback"));
+      }
+      mqttEnergyRecoveryPending = false;
+    } else {
+      // A new boot can reach the broker before ServerSmartPlug has expired
+      // the old live epoch. Keep asking once per second until either a signed
+      // snapshot arrives or the bounded LittleFS fallback is selected.
+      smartPlugMqtt.requestBootSnapshot();
+    }
+  }
   double serverEnergyWh = 0.0;
   bool serverRequestedEnergyReset = false;
   if (smartPlugMqtt.takeEnergySync(serverEnergyWh, serverRequestedEnergyReset)) {
@@ -3348,6 +4500,8 @@ void serviceStatusLed() {
 
 void setup() {
   relay.begin();
+  pinMode(board_pins::kMeterZeroCross, INPUT);
+  attachInterrupt(digitalPinToInterrupt(board_pins::kMeterZeroCross), onZeroCross, CHANGE);
   Serial.begin(115200);
 #ifdef SMARTPLUG_FACTORY_PROVISIONED
   String actualMac = WiFi.macAddress(); actualMac.replace(":", ""); actualMac.toUpperCase();
@@ -3373,36 +4527,138 @@ void setup() {
   }
 #endif
 
+#if SMARTPLUG_ENABLE_MQTT
+  // Load settings before energy recovery: server mode requests its snapshot
+  // first and uses LittleFS only if the server does not answer in time.
+  smartPlugMqtt.begin();
+  if (smartPlugMqtt.mqttMode()) {
+    mqttEnergyRecoveryPending = true;
+    mqttEnergyRecoveryDeadlineAt = millis() + 10000UL;
+  }
+#endif
+
   // Energy recovery is always active. It is deliberately independent from
   // EEPROM settings so normal energy updates never commit the EEPROM sector.
   LittleFSConfig fsConfig;
   fsConfig.setAutoFormat(false);
   LittleFS.setConfig(fsConfig);
+#if SMARTPLUG_LITTLEFS_32K
+  // A prepared record can only be created by the dedicated 64 KiB stage
+  // image. Format happens strictly after the EEPROM record was CRC-verified;
+  // an ordinary 32 KiB/new-device boot never takes this destructive branch.
+  double migrationEnergyWh = 0.0;
+  uint32_t migrationSequence = 0U;
+  const bool migrationPrepared = fs_layout_migration::prepared(
+      migrationEnergyWh, migrationSequence);
+  bool migrationImported = false;
+  if (migrationPrepared) {
+    energyPersistenceReady = LittleFS.format() && LittleFS.begin();
+    if (!energyPersistenceReady) {
+      Serial.println(F("ERR migration_32k_filesystem_initialize_failed"));
+    } else if (!energy_persist::save(migrationEnergyWh, true)) {
+      Serial.println(F("ERR migration_32k_energy_write_failed"));
+    } else if (!fs_layout_migration::markImported(migrationEnergyWh,
+                                                    migrationSequence)) {
+      // The local record is already verified; leave the prepared EEPROM
+      // handoff in place so this boot can safely retry after power loss.
+      Serial.println(F("ERR migration_32k_handoff_mark_failed"));
+    } else {
+      migrationImported = true;
+      Serial.print(F("INFO migration_32k_energy_imported_wh="));
+      Serial.println(migrationEnergyWh, 3);
+    }
+  } else {
+    energyPersistenceReady = LittleFS.begin();
+    if (!energyPersistenceReady) {
+      // A genuinely new unit has no filesystem yet. Initialize it once so the
+      // default energy-recovery policy works without an operator action.
+      energyPersistenceReady = energy_persist::initialize();
+    }
+  }
+#else
   energyPersistenceReady = LittleFS.begin();
   if (!energyPersistenceReady) {
     // A new unit has no filesystem yet. Initialize it once so the default
     // energy-recovery policy works without an operator action.
     energyPersistenceReady = energy_persist::initialize();
   }
+#endif
+  bool recoveredLocalEnergy = false;
+  double savedEnergyWh = 0.0;
   if (energyPersistenceReady) {
-    double savedEnergyWh = 0.0;
-    if (energy_persist::load(savedEnergyWh)) {
+    recoveredLocalEnergy = energy_persist::load(savedEnergyWh);
+    if (recoveredLocalEnergy) {
+#if SMARTPLUG_ENABLE_MQTT
+      if (smartPlugMqtt.mqttMode()) {
+        mqttDeferredLittleFsEnergyWh = savedEnergyWh;
+        mqttDeferredEnergyAvailable = true;
+        mqttEnergyRecoveryPending = true;
+        mqttEnergyRecoveryDeadlineAt = millis() + 10000UL;
+        Serial.print(F("INFO mqtt_boot_waiting_snapshot_wh="));
+        Serial.println(savedEnergyWh, 3);
+      } else {
+        energyIntegrator.restoreEnergyWh(savedEnergyWh);
+        Serial.print(F("INFO energy_restored_wh="));
+        Serial.println(savedEnergyWh, 3);
+      }
+#else
       energyIntegrator.restoreEnergyWh(savedEnergyWh);
       Serial.print(F("INFO energy_restored_wh="));
       Serial.println(savedEnergyWh, 3);
+#endif
     } else {
       Serial.println(F("INFO energy_no_saved_data"));
     }
   } else {
     Serial.println(F("ERR energy_persistence_unavailable"));
   }
+#if SMARTPLUG_LEGACY_FS_MIGRATION_STAGE
+  // This stage never formats or writes LittleFS. A verified current slot is
+  // copied to EEPROM only after normal legacy recovery has succeeded.
+  if (!recoveredLocalEnergy) {
+    Serial.println(F("ERR migration_64k_no_valid_energy_record"));
+  } else if (fs_layout_migration::prepare(savedEnergyWh,
+                                           energy_persist::sequence)) {
+    Serial.print(F("INFO migration_64k_handoff_prepared_wh="));
+    Serial.println(savedEnergyWh, 3);
+  } else {
+    Serial.println(F("ERR migration_64k_handoff_prepare_failed"));
+  }
+#endif
+#if SMARTPLUG_LITTLEFS_32K
+  // After a durable LittleFS write, retire the handoff. If a power loss lands
+  // between markImported and clearImported, the next boot mounts the already
+  // imported filesystem normally rather than formatting it again.
+  if ((migrationImported || fs_layout_migration::imported()) &&
+      !fs_layout_migration::clearImported()) {
+    // No handoff record is the usual path. A valid imported record will be
+    // retried on the next boot, so this is diagnostic only.
+    Serial.println(F("WARN migration_32k_handoff_clear_deferred"));
+  }
+#endif
+  // Credential records share LittleFS with energy persistence.  This must run
+  // only after the filesystem has been mounted (and, for a 64K->32K upgrade,
+  // after the one-time migration/format decision).  Initializing above this
+  // point left the vault permanently unavailable on ordinary boots, silently
+  // falling back to a single legacy owner and rejecting member enrollment.
+  if (energyPersistenceReady && credential_vault::initialize()) {
+    if (!credential_vault::migrateLegacyOwner()) {
+      Serial.println(F("WARN credential_vault_legacy_migration_failed"));
+    }
+  } else {
+    Serial.println(F("WARN credential_vault_unavailable_legacy_owner_only"));
+  }
+#if SMARTPLUG_ENABLE_MQTT
+  // SPMQTT2 state shares the already-mounted LittleFS but has its own A/B
+  // files.  It is initialized here (not in SmartPlugMqtt::begin) so a failed
+  // mount cannot be mistaken for a request to format storage.
+  if (energyPersistenceReady) smartPlugMqtt.initializeSigningMaterial();
+#endif
+#if SMARTPLUG_ENABLE_LOCAL_API
   smartPlugApi.restorePersistedTimer();
+#endif
   lastEnergySaveAt = millis();
   lastEnergySaveAttemptAt = lastEnergySaveAt;
-
-#if SMARTPLUG_ENABLE_MQTT
-  smartPlugMqtt.begin();
-#endif
 
   if (build_config::kButtonEnabled) {
     pinMode(board_pins::kConfigButton, INPUT_PULLUP);

@@ -19,8 +19,8 @@ import org.junit.Test
 
 /**
  * Exercises the SmartPlug pairing state machine against a [MockWebServer] standing in for the
- * device AP, since firmware doesn't implement the `/api/v1/pair` endpoints yet (design.md's own
- * "Status implementasi firmware" admits this) — there is no real device to pair against today.
+ * device AP.  The suite verifies Android's request/state mapping separately from the physical
+ * ESP8266 onboarding tests.
  */
 class PairingRepositoryImplTest {
 
@@ -54,6 +54,22 @@ class PairingRepositoryImplTest {
 
         assertThat(result).isInstanceOf(ApiResult.Success::class.java)
         assertThat((result as ApiResult.Success).value.deviceId).isEqualTo("SP-112233445566")
+    }
+
+    @Test
+    fun `scanHomeWifi uses the pairing scan endpoint and maps nearby networks`() = runTest {
+        server.enqueue(
+            MockResponse().setBody(
+                """{"api_version":"1.0","state":"pairing","networks":[{"ssid":"Mimi","rssi":-48,"security":"secured"}]}"""
+            )
+        )
+
+        val result = repository.scanHomeWifi("abc")
+
+        assertThat(result).isInstanceOf(ApiResult.Success::class.java)
+        val networks = (result as ApiResult.Success).value
+        assertThat(networks).containsExactly(com.smartplug.app.domain.model.HomeWifiNetwork("Mimi", -48, "secured"))
+        assertThat(server.takeRequest().path).isEqualTo("/api/v1/pair/scan-wifi")
     }
 
     @Test
@@ -106,11 +122,12 @@ class PairingRepositoryImplTest {
     }
 }
 
-/** Redirects [ApiClientFactory.pairingApi]'s default base URL to the test [MockWebServer]. */
+/** Redirects pairing clients to the test [MockWebServer]. */
 private class FixedBaseUrlApiClientFactory(
     okHttpClient: OkHttpClient,
     moshi: Moshi,
     private val fixedBaseUrl: String,
 ) : ApiClientFactory(okHttpClient, moshi) {
     override fun pairingApi(baseUrl: String) = super.pairingApi(fixedBaseUrl)
+    override fun pairingScanApi(baseUrl: String) = super.pairingScanApi(fixedBaseUrl)
 }

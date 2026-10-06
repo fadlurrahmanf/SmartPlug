@@ -1,6 +1,6 @@
 # Kontrak REST API SmartPlug — v1
 
-Image `esp07_product` menjalankan REST API HTTP lokal untuk aplikasi. Access
+Image `smartplug_product` menjalankan REST API HTTP lokal untuk aplikasi. Access
 Point tidak menyajikan halaman dashboard maupun form commissioning; aplikasi
 menggunakan endpoint JSON untuk provisioning, QC, monitoring, dan kontrol.
 
@@ -37,8 +37,10 @@ MQTT, server, serta histori aplikasi.
 
 ## Kebijakan akses
 
-Telemetry berikut sengaja **read-only dan public dalam LAN/AP** agar aplikasi
-lokal dapat membaca pengukuran tanpa login:
+Telemetry operasional tidak publik. Endpoint berikut memerlukan `Authorization:
+Bearer <credential>` dari aplikasi yang sudah didaftarkan, atau session browser
+admin yang masih sah. Discovery minimal tetap terpisah agar HP baru dapat
+menemukan identitas SmartPlug sebelum menjalankan alur akses tambahan.
 
 | Endpoint | Isi |
 |---|---|
@@ -54,9 +56,12 @@ lokal dapat membaca pengukuran tanpa login:
 | `GET /api/v1/measurements/energy` | Energi kumulatif terbaru dalam Wh. |
 | `GET /api/v1/health` | Kesehatan komunikasi meter. |
 
-Mutasi administrasi browser memerlukan session dan CSRF token. Aplikasi Android
-boleh memakai owner bearer token hasil pairing untuk relay, timer, reset energi,
-dan factory reset tiga-tahap; tidak ada lagi `GET /relay/on` atau `GET /relay/off`.
+`GET /api/v1` dan `GET /api/v1/capabilities` adalah discovery minimal; keduanya
+tidak memuat telemetry, kredensial, status pairing, atau password. Mutasi
+administrasi browser memerlukan session dan CSRF token. Credential `owner`
+hasil pairing dapat mengelola akses/konfigurasi; credential `member` hasil
+undangan dapat membaca dan mengontrol operasi sehari-hari tanpa mengetahui
+password Wi-Fi atau credential HP lain.
 
 ## Login, session, dan API mutasi
 
@@ -64,7 +69,9 @@ dan factory reset tiga-tahap; tidak ada lagi `GET /relay/on` atau `GET /relay/of
 2. Jika berhasil, respons memberi `csrf_token` dan browser menerima cookie
    `sp_session` dengan atribut `HttpOnly`, `SameSite=Strict`, dan masa hidup
    15 menit.
-3. Setiap `POST` mutasi mengirim header `X-CSRF-Token: <token>` serta cookie.
+3. Setiap `POST` mutasi dari browser mengirim header `X-CSRF-Token: <token>`
+   serta cookie. Aplikasi dapat menggantikan keduanya dengan `Authorization:
+   Bearer <credential>` bila endpoint menerima credential operasional.
 4. `POST /api/v1/auth/logout` menghapus session.
 
 | Endpoint | Input | Hasil |
@@ -72,18 +79,32 @@ dan factory reset tiga-tahap; tidak ada lagi `GET /relay/on` atau `GET /relay/of
 | `POST /api/v1/relay` | `state=on` atau `state=off` | Antrekan pulse relay; minimum satu detik antar-perintah. |
 | `POST /api/v1/settings/wifi` | `ssid`, `password` | Simpan Wi-Fi existing dan mulai koneksi STA. |
 | `GET /api/v1/settings/mqtt` | session | Baca mode integrasi dan metadata broker tanpa password broker. |
-| `POST /api/v1/settings/mqtt` | `mode=rest` atau `mode=mqtt`, serta parameter broker pada mode MQTT | Pilih jalur integrasi dan simpan pengaturan broker. |
+| `POST /api/v1/settings/mqtt` | owner credential atau session admin; `mode=rest` atau `mode=mqtt`, serta parameter broker pada mode MQTT | Pilih jalur integrasi dan simpan pengaturan broker. Credential `member` tidak dapat mengubah atau memutus koneksi ServerSmartPlug. Transisi Direct↔MQTT menghapus timer/Schedule lokal secara deterministik; perubahan tidak menggerakkan relay. |
 | `POST /api/v1/settings/access` | `ap_ssid`, `ap_password`, opsional `admin_password` | Ganti akses AP/admin dan reboot. Password admin baru minimal 12 karakter. |
 | `POST /api/v1/settings/wifi/reset` | — | Factory reset lalu reboot. |
 | `POST /api/v1/energy/reset` | `confirm_1`, `confirm_2`, `confirm_3` semuanya `RESET_ENERGY` | Reset counter energi perangkat setelah konfirmasi tiga tahap. |
-| `GET /api/v1/timer` | owner token atau session | Status timer termasuk `active`, `running`, dan `remaining_ms`. |
-| `POST /api/v1/timer` | `days`, `hours`, `minutes`, `seconds`, atau `action=reset` | Terapkan timer; bila relay OFF, timer baru mulai saat relay ON. Mode langsung tidak bertahan setelah reboot. |
+| `GET /api/v1/timer` | credential operasional (`owner` atau `member`) atau session | Mengembalikan status lengkap yang memuat objek `timer`, termasuk `active`, `running`, dan `remaining_ms`. |
+| `POST /api/v1/timer` | credential operasional (`owner` atau `member`), atau session browser + CSRF; `days`, `hours`, `minutes`, `seconds`, atau `action=reset` | Terapkan timer Direct; bila relay OFF, timer baru mulai saat relay ON. Deadline timer disimpan di LittleFS dan dipulihkan setelah reboot; pada expiry, checkpoint baru dihapus setelah status relay telah `off`. Pada mode MQTT endpoint menolak dengan `409 automation_requires_direct_mode`: timer hanya di ServerSmartPlug. |
+| `GET /api/v1/schedule` | credential operasional (`owner` atau `member`) atau session | Baca jadwal lokal, sinkronisasi jam, jadwal berikutnya, dan daftar entri. |
+| `POST /api/v1/schedule` | credential operasional (`owner` atau `member`), atau session browser + CSRF; `action=set_enabled`, `add`, `delete`, atau `move` | Ubah jadwal Direct; `add` memakai `hour`, `minute`, `state=on|off`, dan `event`; `set_enabled` memakai `enabled=true|false`. Opsional `timezone_offset_minutes` harus −720 s.d. 840. |
 | `POST /api/v1/factory-reset` | owner token + tiga `FACTORY_RESET` | Hapus konfigurasi dan reboot; khusus aplikasi Android. |
 | `GET /api/v1/audit` | session | Audit ring-buffer: login, perubahan setting, relay, dan reset. |
+| `GET /api/v1/access/profile` | credential atau session | Profil aman untuk HP tambahan: identitas, mode integrasi, relay, timer, dan jadwal; tidak ada password Wi-Fi/MQTT. |
+| `POST /api/v1/access/invitations` | owner credential | `role=member`; membuat kode 6 digit sekali pakai selama 5 menit. |
+| `POST /api/v1/access/enroll` | LAN, kode undangan | Body JSON `device_id`, `invite_code`; memberi credential member sekali saja. Tidak tersedia dari subnet AP setup. |
+| `GET /api/v1/access/credentials` | owner credential | ID dan role credential aktif, tanpa token/verifier. |
+| `DELETE /api/v1/access/credentials?credential_id=...` | owner credential | Cabut satu credential member. |
 
 Login salah dibatasi: lima kegagalan berurutan menghasilkan lockout 60 detik.
 Mutasi API dibatasi, dan input SSID/password/state divalidasi sebelum disimpan
-atau diteruskan ke relay.
+atau diteruskan ke relay. Enroll member dibatasi lima kode salah lalu lockout
+60 detik; error sengaja tidak membedakan kode salah, kedaluwarsa, atau undangan
+tidak tersedia.
+
+Timer dan Schedule lokal hanya berwenang dalam mode Direct. Pada mode MQTT,
+`POST /api/v1/timer` maupun `POST /api/v1/schedule` menolak dengan
+`409 automation_requires_direct_mode`; pencegahan ini juga berlaku di loop
+relay sehingga record lokal lama tidak dapat berjalan setelah hand-off.
 
 ## Storage dan pengukuran
 
@@ -137,7 +158,10 @@ Endpoint parameter tunggal memakai format yang konsisten, misalnya
 Transport masih HTTP lokal tanpa TLS. Session/CSRF mengurangi penyalahgunaan dari
 halaman atau klien lain di jaringan, tetapi tidak mengenkripsi password atau
 telemetry terhadap pihak yang telah memiliki akses ke Wi-Fi. Relay API hanya
-menyatakan command queued. Setelah boot, tiga sampel arus valid digunakan untuk
+menyatakan command queued. Klien wajib membaca `relay_state` dan field status
+flat `relay_command_result` untuk hasil terminal; `zero_cross_timeout` berarti
+pulsa dibatalkan karena tidak ada zero crossing yang diterima dalam batas aman,
+sehingga state relay sebelumnya tetap berlaku. Setelah boot, tiga sampel arus valid digunakan untuk
 menentukan state awal: arus terdeteksi menetapkan `on`; tiga pembacaan tanpa
 arus memicu pulse `off`, kemudian status menjadi `off` setelah pulse selesai.
 

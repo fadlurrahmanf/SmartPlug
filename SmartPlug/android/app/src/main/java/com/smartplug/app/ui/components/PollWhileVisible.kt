@@ -24,11 +24,17 @@ import kotlinx.coroutines.delay
  * polled function to defend itself individually.
  */
 @Composable
-fun PollWhileVisible(intervalMs: Long, key: Any? = Unit, onTick: suspend () -> Unit) {
+fun PollWhileVisible(
+    intervalMs: Long,
+    key: Any? = Unit,
+    fixedRate: Boolean = false,
+    onTick: suspend () -> Unit,
+) {
     val lifecycleOwner = LocalLifecycleOwner.current
     LaunchedEffect(key, lifecycleOwner) {
         lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
             while (true) {
+                val startedAtMs = System.currentTimeMillis()
                 try {
                     onTick()
                 } catch (e: CancellationException) {
@@ -37,7 +43,17 @@ fun PollWhileVisible(intervalMs: Long, key: Any? = Unit, onTick: suspend () -> U
                     // Swallow and retry next tick rather than crash; the polled screen's own
                     // state (lastError, etc.) is whatever it was left at from the failed attempt.
                 }
-                delay(intervalMs)
+                // Normal/direct polling deliberately waits a full interval after a response,
+                // preserving the established low-traffic behavior. Server monitoring uses a
+                // fixed-rate cadence instead: a 420 ms request followed by an 80 ms delay still
+                // begins the next snapshot read around the requested 500 ms mark. A slow request
+                // never overlaps with another one; the next attempt starts immediately instead.
+                val waitMs = if (fixedRate) {
+                    (intervalMs - (System.currentTimeMillis() - startedAtMs)).coerceAtLeast(0L)
+                } else {
+                    intervalMs
+                }
+                delay(waitMs)
             }
         }
     }
