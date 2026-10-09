@@ -6,6 +6,7 @@ import com.smartplug.app.data.remote.dto.ServerEnergyDto
 import com.smartplug.app.data.remote.dto.ServerHistoryResponseDto
 import com.smartplug.app.data.remote.dto.ServerLatestDto
 import com.smartplug.app.data.remote.dto.ServerRelayResponseDto
+import com.smartplug.app.data.remote.dto.ServerStatusDto
 import com.smartplug.app.data.remote.dto.DeviceScheduleDto
 import com.smartplug.app.data.remote.dto.MqttAuthDeviceRequestDto
 import com.smartplug.app.data.remote.dto.ServerTimerRequestDto
@@ -52,6 +53,24 @@ interface ServerApi {
     @GET("/api/v1/status")
     suspend fun getServerStatus(
         @Header("Authorization") bearerToken: String,
+    ): Response<Unit>
+
+    /** Same endpoint as [getServerStatus], read for the optional proposed SD "storage" object. */
+    @GET("/api/v1/status")
+    suspend fun getServerStatusDetail(
+        @Header("Authorization") bearerToken: String,
+        /** PROPOSED: ?storage=1 asks the server to include SD capacity (it is slow to compute otherwise). */
+        @Query("storage") storage: Int,
+    ): Response<ServerStatusDto>
+
+    /**
+     * PROPOSED endpoint (server R3.8.21, not yet a design.md contract): deletes the server's
+     * measurement history file to free SD space. Body carries three "RESET_HISTORY" confirmations.
+     */
+    @POST("/api/v1/history/reset")
+    suspend fun resetHistory(
+        @Header("Authorization") bearerToken: String,
+        @Body confirmations: Map<String, String>,
     ): Response<Unit>
 
     @GET("/api/v1/devices")

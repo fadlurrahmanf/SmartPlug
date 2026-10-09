@@ -4,6 +4,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Power
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Storage
 import androidx.compose.ui.graphics.vector.ImageVector
 
 sealed class Routes(val route: String) {
@@ -13,6 +14,8 @@ sealed class Routes(val route: String) {
     data object AddExistingSmartPlug : Routes("add_existing_smartplug")
     data object AddServer : Routes("add_server")
     data object Settings : Routes("settings")
+    data object Storage : Routes("storage")
+    data object Diagnostics : Routes("diagnostics")
 
     data object DeviceDetail : Routes("device/{deviceId}") {
         fun createRoute(deviceId: String) = "device/$deviceId"
@@ -38,8 +41,12 @@ data class TopLevelDestination(
     val icon: ImageVector,
 )
 
-val topLevelDestinations = listOf(
-    TopLevelDestination(Routes.Home.route, "Beranda", "Home", Icons.Filled.Home),
-    TopLevelDestination(Routes.Devices.route, "Perangkat", "Devices", Icons.Filled.Power),
-    TopLevelDestination(Routes.Settings.route, "Pengaturan", "Settings", Icons.Filled.Settings),
-)
+private val homeDestination = TopLevelDestination(Routes.Home.route, "Beranda", "Home", Icons.Filled.Home)
+private val devicesDestination = TopLevelDestination(Routes.Devices.route, "Perangkat", "Devices", Icons.Filled.Power)
+private val storageDestination = TopLevelDestination(Routes.Storage.route, "Storage", "Storage", Icons.Filled.Storage)
+private val settingsDestination = TopLevelDestination(Routes.Settings.route, "Pengaturan", "Settings", Icons.Filled.Settings)
+
+/** Home, Devices, [Storage only when a SERVER-mode SmartPlug is saved], Settings. */
+fun topLevelDestinations(showStorage: Boolean): List<TopLevelDestination> =
+    if (showStorage) listOf(homeDestination, devicesDestination, storageDestination, settingsDestination)
+    else listOf(homeDestination, devicesDestination, settingsDestination)

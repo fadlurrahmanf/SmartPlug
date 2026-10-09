@@ -31,6 +31,41 @@ data class DeviceStatusDto(
     @Json(name = "timer") val timer: DeviceTimerDto? = null,
     @Json(name = "schedule") val schedule: DeviceScheduleDto? = null,
     @Json(name = "energy_persistence") val energyPersistence: EnergyPersistenceDto? = null,
+    // PROPOSED (firmware task, not yet a contract): every field below may be absent.
+    @Json(name = "firmware") val firmware: DeviceFirmwareDto? = null,
+    @Json(name = "uptime_s") val uptimeSeconds: Long? = null,
+    @Json(name = "reset_reason") val resetReason: String? = null,
+    @Json(name = "boot_count") val bootCount: Long? = null,
+    @Json(name = "power_on_policy") val powerOnPolicy: String? = null,
+    @Json(name = "restore_delay_s") val restoreDelaySeconds: Int? = null,
+    @Json(name = "protection") val protection: DeviceProtectionDto? = null,
+    @Json(name = "overcurrent_warning") val overcurrentWarning: Boolean? = null,
+)
+
+@JsonClass(generateAdapter = true)
+data class DeviceFirmwareDto(
+    @Json(name = "version") val version: String? = null,
+)
+
+@JsonClass(generateAdapter = true)
+data class DeviceProtectionDto(
+    @Json(name = "enabled") val enabled: Boolean = false,
+    @Json(name = "tripped") val tripped: Boolean = false,
+    @Json(name = "warn_a") val warnA: Double? = null,
+    @Json(name = "trip_a") val tripA: Double? = null,
+)
+
+/** PROPOSED: POST /api/v1/power-policy. */
+@JsonClass(generateAdapter = true)
+data class PowerPolicyRequestDto(
+    @Json(name = "policy") val policy: String,
+    @Json(name = "restore_delay_s") val restoreDelaySeconds: Int,
+)
+
+/** PROPOSED: POST /api/v1/protection. */
+@JsonClass(generateAdapter = true)
+data class ProtectionRequestDto(
+    @Json(name = "enabled") val enabled: Boolean,
 )
 
 @JsonClass(generateAdapter = true)

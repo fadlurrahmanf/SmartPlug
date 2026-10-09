@@ -1,7 +1,10 @@
 package com.smartplug.app.ui.navigation
 
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.hilt.navigation.compose.hiltViewModel
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.navigation.NavGraph.Companion.findStartDestination
 import androidx.navigation.NavHostController
 import androidx.navigation.compose.NavHost
@@ -13,10 +16,12 @@ import com.smartplug.app.ui.screens.addplug.AddSmartPlugScreen
 import com.smartplug.app.ui.screens.addexisting.AddExistingSmartPlugScreen
 import com.smartplug.app.ui.screens.addserver.AddServerScreen
 import com.smartplug.app.ui.screens.devicedetail.DeviceDetailScreen
+import com.smartplug.app.ui.screens.diagnostics.DiagnosticsScreen
 import com.smartplug.app.ui.screens.devices.DeviceListScreen
 import com.smartplug.app.ui.screens.history.EnergyHistoryScreen
 import com.smartplug.app.ui.screens.home.HomeScreen
 import com.smartplug.app.ui.screens.settings.SettingsScreen
+import com.smartplug.app.ui.screens.storage.StorageScreen
 import com.smartplug.app.ui.screens.schedule.ScheduleScreen
 
 @Composable
@@ -27,9 +32,21 @@ fun SmartPlugNavHost(
 ) {
     val backStackEntry by navController.currentBackStackEntryAsState()
     val currentRoute = backStackEntry?.destination?.route
+    val navShell: NavShellViewModel = hiltViewModel()
+    val showStorage by navShell.showStorage.collectAsStateWithLifecycle()
+
+    // The tab disappears with the last SERVER-mode device; never leave the user on an orphan screen.
+    LaunchedEffect(showStorage, currentRoute) {
+        if (!showStorage && currentRoute == Routes.Storage.route) {
+            navController.navigate(Routes.Home.route) {
+                popUpTo(navController.graph.findStartDestination().id) { inclusive = false }
+                launchSingleTop = true
+            }
+        }
+    }
 
     AppScaffold(
-        destinations = topLevelDestinations,
+        destinations = topLevelDestinations(showStorage),
         currentRoute = currentRoute,
         onNavigate = { route ->
             // A top-level tap must actually leave a detail page.  `popBackStack` avoids a
@@ -91,8 +108,15 @@ fun SmartPlugNavHost(
             composable(Routes.AddServer.route) {
                 AddServerScreen(onDone = { navController.popBackStack() }, onBack = { navController.popBackStack() })
             }
+            composable(Routes.Diagnostics.route) {
+                DiagnosticsScreen(onBack = { navController.popBackStack() })
+            }
+            composable(Routes.Storage.route) {
+                StorageScreen()
+            }
             composable(Routes.Settings.route) {
                 SettingsScreen(
+                    onOpenDiagnostics = { navController.navigate(Routes.Diagnostics.route) },
                     onResetCompleted = {
                         navController.navigate(Routes.Devices.route) {
                             popUpTo(navController.graph.id) { inclusive = true }

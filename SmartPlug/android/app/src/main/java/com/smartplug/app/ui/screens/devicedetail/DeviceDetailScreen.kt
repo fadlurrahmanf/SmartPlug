@@ -52,6 +52,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -78,6 +79,7 @@ import com.smartplug.app.ui.theme.AccentRed
 import com.smartplug.app.ui.localization.LocalAppLanguage
 import com.smartplug.app.ui.localization.localized
 import com.smartplug.app.util.PollingCadence
+import com.smartplug.app.util.applyEnergyAdjustment
 import kotlinx.coroutines.delay
 
 @Composable
@@ -91,11 +93,27 @@ fun DeviceDetailScreen(
 ) {
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
     val language = LocalAppLanguage.current
+    val adjustPercent = com.smartplug.app.util.LocalEnergyAdjustments.current[deviceId] ?: 0.0
     val tapFeedback = rememberTapFeedback()
     var showMenu by remember { mutableStateOf(false) }
     var showRenameDialog by remember { mutableStateOf(false) }
     var confirmAction by remember { mutableStateOf<ConfirmAction?>(null) }
     var showTimerDialog by remember { mutableStateOf(false) }
+    var showLimitDialog by remember { mutableStateOf(false) }
+    var showProtectionDialog by remember { mutableStateOf(false) }
+    var showPowerPolicyDialog by remember { mutableStateOf(false) }
+    var confirmTripRestart by remember { mutableStateOf(false) }
+    val limitToastAlpha = remember { androidx.compose.animation.core.Animatable(0f) }
+    var limitToastShown by remember { mutableStateOf(false) }
+    LaunchedEffect(uiState.limitBlockedNonce) {
+        if (uiState.limitBlockedNonce > 0) {
+            limitToastShown = true
+            limitToastAlpha.snapTo(1f)
+            delay(1300)
+            limitToastAlpha.animateTo(0f, androidx.compose.animation.core.tween(500))
+            limitToastShown = false
+        }
+    }
     var showServerConnectionDialog by remember { mutableStateOf(false) }
     var showNameLoadDialog by remember { mutableStateOf(false) }
     var showMemberInvitationDialog by remember { mutableStateOf(false) }
@@ -157,6 +175,23 @@ fun DeviceDetailScreen(
                             text = { Text(localized(language, "Jadwal", "Schedule")) },
                             onClick = { showMenu = false; onOpenSchedule() },
                         )
+                        DropdownMenuItem(
+                            text = { Text(localized(language, "Set Limit", "Set Limit")) },
+                            onClick = { showMenu = false; showLimitDialog = true },
+                        )
+                        // Owner-only, and only for firmware that reports these settings.
+                        if (uiState.canManageServer && uiState.status?.protection != null) {
+                            DropdownMenuItem(
+                                text = { Text(localized(language, "Proteksi beban", "Load protection")) },
+                                onClick = { showMenu = false; showProtectionDialog = true },
+                            )
+                        }
+                        if (uiState.canManageServer && uiState.status?.powerOnPolicy != null) {
+                            DropdownMenuItem(
+                                text = { Text(localized(language, "Saat listrik kembali", "When power returns")) },
+                                onClick = { showMenu = false; showPowerPolicyDialog = true },
+                            )
+                        }
                         if (uiState.canManageServer) {
                             DropdownMenuItem(
                                 text = { Text(localized(language, "Koneksi Server", "Server Connection")) },
@@ -209,13 +244,49 @@ fun DeviceDetailScreen(
             uiState.status?.takeIf { !it.fresh || !it.hasSample || !it.wifiConnected }?.let {
                 Box(Modifier.entrance(0)) { StatusSection(uiState) }
             }
+            LoadWarningBanners(
+                currentA = uiState.measurement?.currentA,
+                overcurrentFlag = uiState.status?.overcurrentWarning,
+                tripped = uiState.status?.protection?.tripped == true,
+                canRestart = uiState.canManageServer,
+                onRestart = { confirmTripRestart = true },
+            )
             uiState.measurement?.let { measurement ->
                 Box(Modifier.entrance(1)) {
                     MonitoringHero(
                         measurement = measurement,
                         status = uiState.status,
                         serverBacked = device.integrationMode == IntegrationMode.SERVER,
+                        adjustPercent = adjustPercent,
                     )
+                }
+            }
+
+            uiState.measurement?.let { measurement ->
+                if (uiState.limit.enabled && uiState.limit.kwh > 0.0) {
+                    val kwhNow = applyEnergyAdjustment(measurement.energyWh.coerceAtLeast(0.0) / 1000.0, adjustPercent)
+                    val progress = uiState.limit.progress(kwhNow)
+                    val reached = uiState.limit.isReached(kwhNow)
+                    SmartPlugCard(modifier = Modifier.entrance(2)) {
+                        Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                localized(language, "Limit ${formatLimit(uiState.limit.kwh)} kWh", "Limit ${formatLimit(uiState.limit.kwh)} kWh"),
+                                style = MaterialTheme.typography.labelLarge,
+                                modifier = Modifier.weight(1f),
+                            )
+                            Text(
+                                if (reached) localized(language, "Tercapai", "Reached") else "${Math.round(progress * 100)}%",
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = if (reached) AccentRed else MaterialTheme.colorScheme.primary,
+                            )
+                        }
+                        androidx.compose.material3.LinearProgressIndicator(
+                            progress = { progress.toFloat() },
+                            color = if (reached) AccentRed else MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                        )
+                    }
                 }
             }
 
@@ -292,6 +363,7 @@ fun DeviceDetailScreen(
             LiveMeasurementChart(
                 points = uiState.livePoints,
                 onClear = viewModel::clearLiveGraph,
+                energyAdjustPercent = adjustPercent,
                 modifier = Modifier.fillMaxWidth().entrance(5),
             )
 
@@ -327,6 +399,37 @@ fun DeviceDetailScreen(
             onDismiss = { confirmAction = null },
         )
     }
+    if (limitToastShown) {
+        androidx.compose.ui.window.Popup(
+            alignment = Alignment.BottomCenter,
+            offset = androidx.compose.ui.unit.IntOffset(0, -300),
+        ) {
+            androidx.compose.material3.Surface(
+                shape = androidx.compose.foundation.shape.RoundedCornerShape(50),
+                color = MaterialTheme.colorScheme.inverseSurface,
+                modifier = Modifier.graphicsLayer(alpha = limitToastAlpha.value),
+            ) {
+                Text(
+                    localized(language, "Tidak bisa menyalakan: batas kWh tercapai", "Can't turn on: kWh limit reached"),
+                    color = MaterialTheme.colorScheme.inverseOnSurface,
+                    style = MaterialTheme.typography.labelLarge,
+                    modifier = Modifier.padding(horizontal = 18.dp, vertical = 10.dp),
+                )
+            }
+        }
+    }
+    if (showLimitDialog) {
+        SetLimitDialog(
+            currentKwh = applyEnergyAdjustment((uiState.measurement?.energyWh ?: 0.0).coerceAtLeast(0.0) / 1000.0, adjustPercent),
+            limit = uiState.limit,
+            onSave = { enabled, kwh ->
+                tapFeedback.onConfirm()
+                viewModel.setEnergyLimit(enabled, kwh)
+                showLimitDialog = false
+            },
+            onDismiss = { showLimitDialog = false },
+        )
+    }
     if (showTimerDialog) {
         TimerDialog(
             initialRemainingMs = uiState.status?.timerRemainingMs ?: 0L,
@@ -353,7 +456,7 @@ fun DeviceDetailScreen(
             expiresAtMs = uiState.memberInvitationExpiresAtMs,
             nowMs = nowMs,
             isLoading = uiState.isCreatingMemberInvitation,
-            error = uiState.lastError,
+            error = uiState.memberInvitationError,
             onRetry = viewModel::createMemberInvitation,
             onDismiss = { showMemberInvitationDialog = false },
         )
@@ -382,6 +485,63 @@ fun DeviceDetailScreen(
                 }) { Text(localized(language, "Cabut akses", "Revoke"), color = MaterialTheme.colorScheme.error) }
             },
             dismissButton = { TextButton(onClick = { memberPendingRevocation = null }) { Text(localized(language, "Batal", "Cancel")) } },
+        )
+    }
+    if (uiState.serverDisconnectFailed) {
+        SheetDialog(
+            onDismissRequest = viewModel::dismissForceDisconnect,
+            title = { Text(localized(language, "Putuskan paksa?", "Force disconnect?")) },
+            text = {
+                Text(
+                    localized(
+                        language,
+                        "Server tidak bisa dihubungi atau menolak. SmartPlug tetap dikembalikan ke mode Direct, tetapi timer/jadwal yang masih tersimpan di server untuk SmartPlug ini tidak dibersihkan.",
+                        "The server is unreachable or refused. The SmartPlug is still returned to Direct mode, but any timer/schedule the server holds for it is not cleared.",
+                    ),
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = { viewModel.disconnectFromServer(force = true) }) {
+                    Text(localized(language, "Putuskan paksa", "Force disconnect"), color = MaterialTheme.colorScheme.error)
+                }
+            },
+            dismissButton = { TextButton(onClick = viewModel::dismissForceDisconnect) { Text(localized(language, "Batal", "Cancel")) } },
+        )
+    }
+    if (showProtectionDialog) {
+        ProtectionDialog(
+            enabled = uiState.status?.protection?.enabled == true,
+            error = uiState.lastError,
+            onChange = { viewModel.setProtection(it) },
+            onDismiss = { showProtectionDialog = false },
+        )
+    }
+    if (showPowerPolicyDialog) {
+        PowerPolicyDialog(
+            current = uiState.status?.powerOnPolicy ?: com.smartplug.app.domain.model.PowerOnPolicy.OFF,
+            currentDelaySeconds = uiState.status?.restoreDelaySeconds ?: 3,
+            error = uiState.lastError,
+            onSave = { policy, delay -> viewModel.setPowerPolicy(policy, delay) { showPowerPolicyDialog = false } },
+            onDismiss = { showPowerPolicyDialog = false },
+        )
+    }
+    if (confirmTripRestart) {
+        SheetDialog(
+            onDismissRequest = { confirmTripRestart = false },
+            title = { Text(localized(language, "Nyalakan lagi?", "Turn on again?")) },
+            text = {
+                Text(localized(
+                    language,
+                    "Pastikan beban yang tersambung sudah dikurangi, lalu nyalakan lagi.",
+                    "Make sure you have reduced what is plugged in, then turn it on again.",
+                ))
+            },
+            confirmButton = {
+                TextButton(onClick = { confirmTripRestart = false; viewModel.setRelay(true) }) {
+                    Text(localized(language, "Nyalakan", "Turn on"))
+                }
+            },
+            dismissButton = { TextButton(onClick = { confirmTripRestart = false }) { Text(localized(language, "Batal", "Cancel")) } },
         )
     }
     if (showServerConnectionDialog && device != null) {
@@ -687,6 +847,94 @@ private fun TripleConfirmDialog(action: ConfirmAction, deviceName: String, onCom
     )
 }
 
+private fun formatLimit(value: Double): String {
+    val text = String.format(java.util.Locale.US, "%.3f", value)
+    return text.trimEnd('0').trimEnd('.').ifEmpty { "0" }
+}
+
+@OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
+@Composable
+private fun SetLimitDialog(
+    currentKwh: Double,
+    limit: com.smartplug.app.data.local.EnergyLimit,
+    onSave: (Boolean, Double) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val language = LocalAppLanguage.current
+    var enabled by remember { mutableStateOf(limit.enabled) }
+    // Start from the live kWh so the user adds on top of it, unless a higher limit is already set.
+    var text by remember { mutableStateOf(formatLimit(if (limit.enabled && limit.kwh > currentKwh) limit.kwh else currentKwh)) }
+    val value = text.toDoubleOrNull()
+    val valid = value != null && value > 0.0
+    SheetDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(localized(language, "Set Limit kWh", "Set kWh limit")) },
+        text = {
+            Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(10.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Text(localized(language, "Aktifkan limit", "Enable limit"), modifier = Modifier.weight(1f))
+                    androidx.compose.material3.Switch(checked = enabled, onCheckedChange = { enabled = it })
+                }
+                Text(
+                    localized(language, "kWh saat ini: ${formatLimit(currentKwh)}", "Current kWh: ${formatLimit(currentKwh)}"),
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                androidx.compose.material3.OutlinedTextField(
+                    value = text,
+                    onValueChange = { raw ->
+                        val cleaned = raw.replace(',', '.').filter { it.isDigit() || it == '.' }
+                        if (cleaned.count { it == '.' } <= 1) text = cleaned
+                    },
+                    label = { Text(localized(language, "Limit (kWh)", "Limit (kWh)")) },
+                    singleLine = true,
+                    isError = !valid,
+                    keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
+                        keyboardType = androidx.compose.ui.text.input.KeyboardType.Decimal,
+                    ),
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                androidx.compose.foundation.layout.FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    listOf(0.5, 1.0, 2.0, 5.0, 10.0, 100.0).forEach { step ->
+                        androidx.compose.material3.AssistChip(
+                            onClick = { text = formatLimit((text.toDoubleOrNull() ?: currentKwh) + step) },
+                            label = { Text("+${formatLimit(step)} kWh") },
+                        )
+                    }
+                    androidx.compose.material3.AssistChip(
+                        onClick = { text = formatLimit(currentKwh) },
+                        label = { Text(localized(language, "= kWh sekarang", "= current kWh")) },
+                    )
+                }
+                if (enabled && valid && value != null && value <= currentKwh) {
+                    Text(
+                        localized(language, "Limit sudah tercapai: relay akan dimatikan dan tidak bisa dinyalakan.", "Limit already reached: the relay will be turned off and cannot be turned on."),
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.error,
+                        textAlign = TextAlign.Center,
+                    )
+                }
+                Text(
+                    localized(language, "Limit bekerja saat aplikasi terbuka.", "The limit acts while the app is open."),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    textAlign = TextAlign.Center,
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = { onSave(enabled, value ?: limit.kwh) },
+                enabled = !enabled || valid,
+            ) { Text(localized(language, "Simpan", "Save")) }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text(localized(language, "Batal", "Cancel")) } },
+    )
+}
+
 @Composable
 private fun TimerDialog(
     initialRemainingMs: Long,
@@ -709,9 +957,17 @@ private fun TimerDialog(
         onDismissRequest = onDismiss,
         title = { Text(localized(language, "Timer SmartPlug", "SmartPlug timer")) },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text(localized(language, "Timer disimpan di SmartPlug/server. Jika disetel saat relay OFF, hitung mundur mulai ketika relay ON.", "The timer is stored on the SmartPlug/server. If set while the relay is OFF, countdown starts when the relay turns ON."), style = MaterialTheme.typography.bodySmall)
-                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                Text(
+                    localized(language, "Timer disimpan di SmartPlug/server. Jika disetel saat relay OFF, hitung mundur mulai ketika relay ON.", "The timer is stored on the SmartPlug/server. If set while the relay is OFF, countdown starts when the relay turns ON."),
+                    style = MaterialTheme.typography.bodySmall,
+                    textAlign = TextAlign.Center,
+                )
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center) {
                     TimerWheel(localized(language, "Jam", "Hours"), 0..99, hours) { hours = it }
                     TimerWheel(localized(language, "Menit", "Minutes"), 0..59, minutes) { minutes = it }
                     TimerWheel(localized(language, "Detik", "Seconds"), 0..59, seconds) { seconds = it }
@@ -734,63 +990,10 @@ private fun TimerDialog(
 }
 
 @Composable
-private fun RowScope.TimerWheel(label: String, range: IntRange, selected: Int, onSelect: (Int) -> Unit) {
-    val previous = if (selected == range.first) range.last else selected - 1
-    val next = if (selected == range.last) range.first else selected + 1
-    var dragDistance by remember { mutableStateOf(0f) }
-    Column(modifier = Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
-        Text(label, style = MaterialTheme.typography.labelMedium)
-        // A fixed, three-row wheel intentionally mirrors the handset Clock
-        // layout: only previous / active / next can ever be visible. Each
-        // vertical swipe advances one deterministic step, so it cannot leave
-        // an unsnapped partial fourth row after a rapid gesture.
-        Column(
-            modifier = Modifier
-                .height(168.dp)
-                .clipToBounds()
-                .pointerInput(selected, range) {
-                    detectVerticalDragGestures(
-                        onDragStart = { dragDistance = 0f },
-                        onVerticalDrag = { _, amount -> dragDistance += amount },
-                        onDragEnd = {
-                            when {
-                                dragDistance <= -24f -> onSelect(next)
-                                dragDistance >= 24f -> onSelect(previous)
-                            }
-                            dragDistance = 0f
-                        },
-                        onDragCancel = { dragDistance = 0f },
-                    )
-                },
-            horizontalAlignment = Alignment.CenterHorizontally,
-        ) {
-            Text(
-                text = "%02d".format(previous),
-                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.35f),
-                style = MaterialTheme.typography.titleMedium,
-                textAlign = TextAlign.Center,
-                modifier = Modifier.fillMaxWidth().height(56.dp).clickable { onSelect(previous) }.padding(vertical = 5.dp),
-            )
-            Text(
-                text = "%02d".format(selected),
-                color = MaterialTheme.colorScheme.primary,
-                fontWeight = FontWeight.Bold,
-                style = MaterialTheme.typography.displaySmall,
-                textAlign = TextAlign.Center,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(56.dp)
-                    .background(MaterialTheme.colorScheme.surfaceVariant, androidx.compose.foundation.shape.RoundedCornerShape(12.dp))
-                    .padding(vertical = 5.dp),
-            )
-            Text(
-                text = "%02d".format(next),
-                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.35f),
-                style = MaterialTheme.typography.titleMedium,
-                textAlign = TextAlign.Center,
-                modifier = Modifier.fillMaxWidth().height(56.dp).clickable { onSelect(next) }.padding(vertical = 5.dp),
-            )
-        }
+private fun TimerWheel(label: String, range: IntRange, selected: Int, onSelect: (Int) -> Unit) {
+    Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(horizontal = 4.dp)) {
+        Text(label, style = MaterialTheme.typography.labelMedium, textAlign = TextAlign.Center)
+        com.smartplug.app.ui.components.NumberWheel(range = range, value = selected, onValueChange = onSelect)
     }
 }
 
@@ -813,9 +1016,11 @@ private fun MonitoringHero(
     measurement: ElectricalMeasurement,
     status: DeviceStatus?,
     serverBacked: Boolean,
+    adjustPercent: Double = 0.0,
 ) {
     val language = LocalAppLanguage.current
     val live = status?.fresh == true
+    val shownKwh = applyEnergyAdjustment(measurement.energyWh.coerceAtLeast(0.0) / 1000.0, adjustPercent)
     Box(
         modifier = Modifier.fillMaxWidth().background(
             Brush.verticalGradient(
@@ -834,8 +1039,8 @@ private fun MonitoringHero(
             )
             Row(verticalAlignment = Alignment.Bottom, horizontalArrangement = Arrangement.Center) {
                 AnimatedDecimal(
-                    value = measurement.energyWh.coerceAtLeast(0.0) / 1000.0,
-                    decimals = 5,
+                    value = shownKwh,
+                    decimals = com.smartplug.app.util.LocalKwhDecimals.current,
                     style = MaterialTheme.typography.displayLarge,
                     fontWeight = FontWeight.SemiBold,
                     textAlign = TextAlign.Center,
@@ -846,6 +1051,26 @@ private fun MonitoringHero(
                     fontFamily = com.smartplug.app.ui.theme.SmartPlugMono,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(bottom = 8.dp),
+                )
+            }
+            val costConfig = com.smartplug.app.ui.components.LocalCostConfig.current
+            if (costConfig.active) {
+                Text(
+                    "≈ ${costConfig.format(shownKwh)}",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+            }
+            if (measurement.activePowerW > 0.0) {
+                // Instantaneous rate from active power (W / 60000 = kWh per minute), 4 decimals.
+                val kwhPerMinute = applyEnergyAdjustment(measurement.activePowerW / 60_000.0, adjustPercent)
+                Text(
+                    if (kwhPerMinute < 0.0001) "+<0.0001 kWh/min"
+                    else "+${String.format(java.util.Locale.US, "%.4f", kwhPerMinute)} kWh/min",
+                    style = MaterialTheme.typography.labelSmall,
+                    fontFamily = com.smartplug.app.ui.theme.SmartPlugMono,
+                    color = AccentGreen,
                 )
             }
             Text(

@@ -7,6 +7,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.viewModels
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
@@ -68,12 +69,21 @@ class MainActivity : ComponentActivity() {
         val crashText = CrashLogStore.consumeLast(applicationContext)
         setContent {
             val settings by shellViewModel.settings.collectAsState()
-            CompositionLocalProvider(LocalAppLanguage provides settings.language) {
+            CompositionLocalProvider(
+                LocalAppLanguage provides settings.language,
+                com.smartplug.app.ui.components.LocalCostConfig provides
+                    com.smartplug.app.ui.components.CostConfig(settings.costEnabled, settings.tariffPerKwh),
+                com.smartplug.app.util.LocalEnergyAdjustments provides settings.kwhAdjustments,
+                com.smartplug.app.util.LocalKwhDecimals provides settings.kwhDecimals,
+                com.smartplug.app.ui.components.LocalDailySummaryEnabled provides settings.dailySummaryEnabled,
+            ) {
                 SmartPlugTheme(themeMode = settings.themeMode) {
-                    SmartPlugNavHost(
-                        sidebarHidden = settings.sidebarHidden,
-                        onToggleSidebarHidden = { shellViewModel.toggleSidebarHidden(settings.sidebarHidden) },
-                    )
+                    com.smartplug.app.ui.components.TapFeedbackHost(modifier = Modifier.fillMaxSize()) {
+                        SmartPlugNavHost(
+                            sidebarHidden = settings.sidebarHidden,
+                            onToggleSidebarHidden = { shellViewModel.toggleSidebarHidden(settings.sidebarHidden) },
+                        )
+                    }
                     if (crashText != null) {
                         CrashReportDialog(crashText)
                     }

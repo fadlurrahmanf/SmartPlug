@@ -49,6 +49,7 @@ fun SheetDialog(
 ) {
     val state = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     ModalBottomSheet(onDismissRequest = onDismissRequest, sheetState = state, modifier = modifier) {
+        TapFeedbackHost {
         Column(
             modifier = Modifier
                 .fillMaxWidth()
@@ -64,6 +65,7 @@ fun SheetDialog(
                 dismissButton?.invoke()
                 confirmButton()
             }
+        }
         }
     }
 }

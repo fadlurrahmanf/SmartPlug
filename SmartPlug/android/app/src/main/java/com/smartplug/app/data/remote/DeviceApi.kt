@@ -95,6 +95,20 @@ interface DeviceApi {
         @Header("Authorization") bearerToken: String,
     ): Response<DeviceAccessProfileDto>
 
+    /** PROPOSED (firmware task): not part of the current contract; older firmware answers 404. */
+    @POST("/api/v1/power-policy")
+    suspend fun setPowerPolicy(
+        @Header("Authorization") bearerToken: String,
+        @Body request: com.smartplug.app.data.remote.dto.PowerPolicyRequestDto,
+    ): Response<Unit>
+
+    /** PROPOSED (firmware task): overcurrent protection switch. */
+    @POST("/api/v1/protection")
+    suspend fun setProtection(
+        @Header("Authorization") bearerToken: String,
+        @Body request: com.smartplug.app.data.remote.dto.ProtectionRequestDto,
+    ): Response<Unit>
+
     @POST("/api/v1/access/invitations")
     suspend fun createAccessInvitation(
         @Header("Authorization") bearerToken: String,

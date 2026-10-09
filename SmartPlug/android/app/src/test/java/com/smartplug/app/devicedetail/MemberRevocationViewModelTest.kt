@@ -67,6 +67,7 @@ class MemberRevocationViewModelTest {
             mockk<HistoryDao>(relaxed = true),
             mockk<LoadSignatureDao>(relaxed = true),
             mockk<ServerProfileStore>(relaxed = true),
+        mockk<com.smartplug.app.data.local.AppPreferences>(relaxed = true),
         )
         dispatcher.scheduler.advanceUntilIdle()
 

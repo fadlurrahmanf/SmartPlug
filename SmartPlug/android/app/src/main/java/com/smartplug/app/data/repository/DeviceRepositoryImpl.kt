@@ -115,24 +115,29 @@ class DeviceRepositoryImpl @Inject constructor(
         return result
     }
 
-    override suspend fun disconnectFromServer(device: SmartPlugDevice): ApiResult<Unit> {
+    override suspend fun disconnectFromServer(device: SmartPlugDevice, force: Boolean): ApiResult<Unit> {
         val lanIp = device.lanIp ?: return missingLanIpFailure()
         val bearer = requireOwnerToken(device.deviceId) ?: return missingTokenFailure()
-        val serverId = device.serverId ?: return missingServerTokenFailure()
-        val serverHost = device.serverHost ?: return missingServerFailure()
-        val serverToken = tokenStore.serverApiToken(serverId) ?: return missingServerTokenFailure()
-        val serverApi = apiClientFactory.serverApi(
-            ApiClientFactory.hostBaseUrl(serverHost, device.serverPort),
-        )
+        // If this phone no longer holds the server (Unpair Server removed its token), there is no
+        // server cleanup left to do and the SmartPlug must still be able to leave Server mode.
+        val serverToken = device.serverId?.let { tokenStore.serverApiToken(it) }
+        val serverHost = device.serverHost
+        val serverApi = if (serverToken != null && serverHost != null) {
+            apiClientFactory.serverApi(ApiClientFactory.hostBaseUrl(serverHost, device.serverPort))
+        } else null
 
         // A Direct profile must not leave an active server timer or schedule
         // behind.  Detach server automation first; if the server is not
         // reachable or refuses the reset, preserve Server mode so the user can
         // retry instead of creating an ambiguous split authority.
-        val automationReset = safeApiCall {
-            serverApi.resetAutomation("Bearer $serverToken", device.deviceId)
+        if (serverApi != null) {
+            val automationReset = safeApiCall {
+                serverApi.resetAutomation("Bearer $serverToken", device.deviceId)
+            }
+            // A forced disconnect (confirmed by the user because the server is unreachable or rejects
+            // us) continues; the server may keep its timer/schedule for this device until it is reset.
+            if (automationReset is ApiResult.Failure && !force) return automationReset
         }
-        if (automationReset is ApiResult.Failure) return automationReset
 
         val api = apiClientFactory.deviceApi(ApiClientFactory.lanBaseUrl(lanIp))
         val result = safeApiCall {
@@ -146,8 +151,10 @@ class DeviceRepositoryImpl @Inject constructor(
             // Revoke the now-unused server key when this phone owns the
             // matching server profile, but never turn a successful Direct
             // disconnect into a failure merely because the server is offline.
-            safeApiCall {
-                serverApi.deleteMqttAuthDevice("Bearer $serverToken", device.deviceId)
+            if (serverApi != null) {
+                safeApiCall {
+                    serverApi.deleteMqttAuthDevice("Bearer $serverToken", device.deviceId)
+                }
             }
         }
         return result
@@ -244,6 +251,16 @@ class DeviceRepositoryImpl @Inject constructor(
                 scheduleTurnOn = dto.schedule?.next?.state?.let { if (it == "on") true else if (it == "off") false else null },
                 energySavedWh = dto.energyPersistence?.takeIf { it.ready && it.savedAvailable }?.savedWh,
                 energyNextSaveMs = dto.energyPersistence?.takeIf { it.ready }?.nextSaveSeconds?.times(1000L),
+                firmwareVersion = dto.firmware?.version,
+                uptimeSeconds = dto.uptimeSeconds,
+                resetReason = dto.resetReason,
+                bootCount = dto.bootCount,
+                powerOnPolicy = com.smartplug.app.domain.model.PowerOnPolicy.fromWire(dto.powerOnPolicy),
+                restoreDelaySeconds = dto.restoreDelaySeconds,
+                protection = dto.protection?.let {
+                    com.smartplug.app.domain.model.ProtectionStatus(it.enabled, it.tripped, it.warnA, it.tripA)
+                },
+                overcurrentWarning = dto.overcurrentWarning,
             )
         }
     }

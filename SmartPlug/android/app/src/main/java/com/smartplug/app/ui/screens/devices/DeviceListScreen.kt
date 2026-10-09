@@ -295,9 +295,10 @@ private fun DeviceRowCard(row: DeviceRow, busy: Boolean, onClick: () -> Unit, on
                 )
             }
             row.measurement?.let { m ->
+                val adjustPercent = com.smartplug.app.util.LocalEnergyAdjustments.current[row.device.deviceId] ?: 0.0
                 Column(horizontalAlignment = Alignment.End) {
                     Text(
-                        String.format(Locale.US, "%.3f", m.energyWh.coerceAtLeast(0.0) / 1000.0),
+                        com.smartplug.app.util.formatKwhValue(com.smartplug.app.util.applyEnergyAdjustment(m.energyWh.coerceAtLeast(0.0) / 1000.0, adjustPercent), com.smartplug.app.util.LocalKwhDecimals.current),
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.SemiBold,
                         fontFamily = com.smartplug.app.ui.theme.SmartPlugMono,

@@ -16,6 +16,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Edit
 import com.smartplug.app.ui.components.SheetDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.FilterChip
@@ -60,6 +61,7 @@ fun ScheduleScreen(
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
     val language = LocalAppLanguage.current
     var showAdd by remember { mutableStateOf(false) }
+    var editing by remember { mutableStateOf<IndexedValue<DailyScheduleEntry>?>(null) }
     var nowMs by remember { mutableLongStateOf(System.currentTimeMillis()) }
     LaunchedEffect(Unit) { while (true) { nowMs = System.currentTimeMillis(); delay(1_000) } }
     // Refresh the firmware-owned next occurrence so the countdown rolls to tomorrow after an
@@ -128,6 +130,7 @@ fun ScheduleScreen(
                     ScheduleEntryCard(
                         entry = indexedEntry.value,
                         isNext = indexedEntry.index == nextIndex,
+                        onEdit = { editing = indexedEntry },
                         onDelete = { viewModel.delete(indexedEntry.index) },
                     )
                 }
@@ -152,10 +155,23 @@ fun ScheduleScreen(
             },
         )
     }
+    editing?.let { target ->
+        AddScheduleDialog(
+            initialHour = target.value.hour,
+            initialMinute = target.value.minute,
+            initialTurnOn = target.value.turnOn,
+            initialEvent = target.value.event,
+            isEdit = true,
+            onDismiss = { editing = null },
+            onAdd = { hour, minute, turnOn, event ->
+                viewModel.edit(target.index, target.value, hour, minute, turnOn, event, timezoneOffset) { editing = null }
+            },
+        )
+    }
 }
 
 @Composable
-private fun ScheduleEntryCard(entry: DailyScheduleEntry, isNext: Boolean, onDelete: () -> Unit) {
+private fun ScheduleEntryCard(entry: DailyScheduleEntry, isNext: Boolean, onEdit: () -> Unit, onDelete: () -> Unit) {
     val language = LocalAppLanguage.current
     SmartPlugCard(
         highlighted = isNext,
@@ -191,6 +207,7 @@ private fun ScheduleEntryCard(entry: DailyScheduleEntry, isNext: Boolean, onDele
                     )
                 }
             }
+            IconButton(onClick = onEdit) { Icon(Icons.Filled.Edit, localized(language, "Edit jadwal", "Edit schedule")) }
             IconButton(onClick = onDelete) { Icon(Icons.Filled.Delete, "Delete") }
         }
     }
@@ -202,32 +219,47 @@ private fun AddScheduleDialog(
     initialMinute: Int,
     onDismiss: () -> Unit,
     onAdd: (Int, Int, Boolean, String) -> Unit,
+    initialTurnOn: Boolean = true,
+    initialEvent: String = "",
+    isEdit: Boolean = false,
 ) {
     val language = LocalAppLanguage.current
     // A schedule is evaluated by SmartPlug/ServerSmartPlug time, not by the
     // time when this composable happened to be first created.  Seed the form
     // from that authority so a new entry does not misleadingly start at 00:00.
-    var hour by remember(initialHour) { mutableStateOf("%02d".format(initialHour)) }
-    var minute by remember(initialMinute) { mutableStateOf("%02d".format(initialMinute)) }
-    var turnOn by remember { mutableStateOf(true) }
-    var event by remember { mutableStateOf("") }
-    val valid = hour.toIntOrNull() in 0..23 && minute.toIntOrNull() in 0..59
+    var hour by remember(initialHour) { mutableStateOf(initialHour.coerceIn(0, 23)) }
+    var minute by remember(initialMinute) { mutableStateOf(initialMinute.coerceIn(0, 59)) }
+    var turnOn by remember { mutableStateOf(initialTurnOn) }
+    var event by remember { mutableStateOf(initialEvent) }
+    val valid = true
     val eventValid = event.length <= 24 && event.all { character ->
         character.code in 0x20..0x7e && character !in setOf(',', ':', '"', '\\')
     }
     SheetDialog(
         onDismissRequest = onDismiss,
-        title = { Text(localized(language, "Tambah jadwal", "Add schedule")) },
+        title = { Text(if (isEdit) localized(language, "Edit jadwal", "Edit schedule") else localized(language, "Tambah jadwal", "Add schedule")) },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally), modifier = Modifier.fillMaxWidth()) {
                     FilterChip(selected = turnOn, onClick = { turnOn = true }, label = { Text("ON") })
                     FilterChip(selected = !turnOn, onClick = { turnOn = false }, label = { Text("OFF") })
                 }
-                Text(localized(language, "Setiap hari pada waktu berikut (format 24 jam)", "Every day at (24-hour time)"))
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutlinedTextField(value = hour, onValueChange = { hour = it.take(2) }, label = { Text("HH") }, modifier = Modifier.weight(1f))
-                    OutlinedTextField(value = minute, onValueChange = { minute = it.take(2) }, label = { Text("MM") }, modifier = Modifier.weight(1f))
+                Text(
+                    localized(language, "Setiap hari pada waktu berikut (format 24 jam)", "Every day at (24-hour time)"),
+                    textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.Center,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    com.smartplug.app.ui.components.NumberWheel(range = 0..23, value = hour, onValueChange = { hour = it })
+                    Text(":", style = MaterialTheme.typography.headlineMedium, modifier = Modifier.padding(horizontal = 8.dp))
+                    com.smartplug.app.ui.components.NumberWheel(range = 0..59, value = minute, onValueChange = { minute = it })
                 }
                 OutlinedTextField(
                     value = event,
@@ -240,7 +272,7 @@ private fun AddScheduleDialog(
                 )
             }
         },
-        confirmButton = { TextButton(onClick = { onAdd(hour.toInt(), minute.toInt(), turnOn, event) }, enabled = valid && eventValid) { Text(localized(language, "Tambah", "Add")) } },
+        confirmButton = { TextButton(onClick = { onAdd(hour, minute, turnOn, event) }, enabled = valid && eventValid) { Text(if (isEdit) localized(language, "Simpan", "Save") else localized(language, "Tambah", "Add")) } },
         dismissButton = { TextButton(onClick = onDismiss) { Text(localized(language, "Batal", "Cancel")) } },
     )
 }

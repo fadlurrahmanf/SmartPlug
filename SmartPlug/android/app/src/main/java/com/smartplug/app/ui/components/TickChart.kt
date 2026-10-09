@@ -121,12 +121,12 @@ fun TickChart(
     }
 }
 
-private class NiceScale(val step: Double, val count: Int) {
+internal class NiceScale(val step: Double, val count: Int) {
     val top: Double get() = step * count
 }
 
 /** Round tick step (1, 2, 2.5, 5 x 10^n) so the axis has about four intervals from zero. */
-private fun niceScale(maxValue: Double): NiceScale {
+internal fun niceScale(maxValue: Double): NiceScale {
     val rough = (if (maxValue <= 0.0) 1.0 else maxValue) / 4.0
     val magnitude = 10.0.pow(floor(log10(rough)))
     val n = rough / magnitude

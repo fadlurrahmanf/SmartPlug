@@ -68,6 +68,7 @@ class SecureTokenStore @Inject constructor(
         prefs.edit()
             .remove(accessCredentialKey(deviceId))
             .remove(accessRoleKey(deviceId))
+            .remove(invitationKey(deviceId))
             .apply()
     }
 
@@ -113,6 +114,27 @@ class SecureTokenStore @Inject constructor(
         prefs.edit().putString(wifiKey(ssid), password).apply()
     }
 
+    /**
+     * The last member invitation code this app created for a SmartPlug, kept until it expires so
+     * closing the dialog (or the app) does not strand the owner: the SmartPlug refuses a new code
+     * while one is valid and never shows it again. Cleared automatically once expired.
+     */
+    fun saveInvitation(deviceId: String, code: String, expiresAtMs: Long) {
+        prefs.edit().putString(invitationKey(deviceId), "$expiresAtMs:$code").apply()
+    }
+
+    fun activeInvitation(deviceId: String, nowMs: Long = System.currentTimeMillis()): Pair<String, Long>? {
+        val raw = prefs.getString(invitationKey(deviceId), null) ?: return null
+        val separator = raw.indexOf(':')
+        val expiresAtMs = if (separator > 0) raw.substring(0, separator).toLongOrNull() else null
+        val code = if (separator > 0) raw.substring(separator + 1) else ""
+        if (expiresAtMs == null || code.isEmpty() || expiresAtMs <= nowMs) {
+            prefs.edit().remove(invitationKey(deviceId)).apply()
+            return null
+        }
+        return code to expiresAtMs
+    }
+
     /** Used only after every registered SmartPlug has accepted a factory-reset command. */
     fun clearAll() {
         prefs.edit().clear().apply()
@@ -122,6 +144,7 @@ class SecureTokenStore @Inject constructor(
     // already-working Direct owner credential.  The semantic API above is role-neutral.
     private fun accessCredentialKey(deviceId: String) = "owner_token_$deviceId"
     private fun accessRoleKey(deviceId: String) = "access_role_$deviceId"
+    private fun invitationKey(deviceId: String) = "member_invite_$deviceId"
     private fun wifiKey(ssid: String) = "wifi_pw_$ssid"
     private fun serverTokenKey(serverId: String) = "server_api_token_$serverId"
 

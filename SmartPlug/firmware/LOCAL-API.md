@@ -1,8 +1,8 @@
 # Kontrak REST API SmartPlug — v1
 
-Image `smartplug_product` menjalankan REST API HTTP lokal untuk aplikasi. Access
-Point tidak menyajikan halaman dashboard maupun form commissioning; aplikasi
-menggunakan endpoint JSON untuk provisioning, QC, monitoring, dan kontrol.
+Image produk menjalankan REST API HTTP lokal untuk aplikasi. Access Point juga
+menyajikan portal browser lokal; aplikasi tetap memakai endpoint JSON untuk
+provisioning, QC, monitoring, dan kontrol.
 
 ## Provisioning awal
 
@@ -11,8 +11,8 @@ untuk dipilih oleh aplikasi Android.
 
 | Parameter | Perilaku |
 |---|---|
-| SSID | `SmartPlug-Setup` |
-| Password AP | `SmartPlug123` |
+| SSID | `SP-<unit_id>` pada profil kompatibilitas; profil factory mengikuti identitas factory yang diprovisi. |
+| Password AP | `setup-<unit_id>` pada profil kompatibilitas; profil factory mengikuti kredensial factory. |
 | Akun admin | Username `admin`; password awal `SmartPlug123`. |
 | IP AP | `192.168.4.1`, HTTP port 80. |
 
@@ -55,6 +55,8 @@ menemukan identitas SmartPlug sebelum menjalankan alur akses tambahan.
 | `GET /api/v1/measurements/power-factor` | Power factor terbaru dalam PF. |
 | `GET /api/v1/measurements/energy` | Energi kumulatif terbaru dalam Wh. |
 | `GET /api/v1/health` | Kesehatan komunikasi meter. |
+| `GET /api/v1/diagnostics` | Reset reason, heap, Wi-Fi/MQTT, relay, zero crossing, BL0940, LittleFS/energi, dan 24 event terakhir. Khusus session admin atau bearer **owner**. |
+| `GET /diagnostics` | Halaman diagnostik lokal read-only, memakai session admin browser (atau bearer owner dari klien HTTP); target awal-ke-awal 1 detik, tanpa request overlap. |
 
 `GET /api/v1` dan `GET /api/v1/capabilities` adalah discovery minimal; keduanya
 tidak memuat telemetry, kredensial, status pairing, atau password. Mutasi
@@ -62,6 +64,33 @@ administrasi browser memerlukan session dan CSRF token. Credential `owner`
 hasil pairing dapat mengelola akses/konfigurasi; credential `member` hasil
 undangan dapat membaca dan mengontrol operasi sehari-hari tanpa mengetahui
 password Wi-Fi atau credential HP lain.
+
+## Wi-Fi Diagnostics (R3.10.11, source/build saja)
+
+Sambungkan HP/komputer ke AP SmartPlug dan buka `http://192.168.4.1/`, login
+admin, lalu buka `http://192.168.4.1/diagnostics`. Endpoint JSON yang sama
+tersedia di `GET /api/v1/diagnostics` memakai cookie session admin atau
+`Authorization: Bearer <owner_key>`; credential member tidak diizinkan.
+Respons berisi `firmware_version`, `device_id`, `uptime_ms`, `reset_reason`,
+`free_heap`, `max_free_block`, objek `wifi`, `integration`, `relay`,
+`zero_cross`, `bl0940`, `storage`, serta `events` terbaru lebih dahulu.
+`zero_cross.status` dapat berupa `valid`, `waiting`, `timeout` (fallback
+zero-cross terjadi dalam 5 detik terakhir), atau `unavailable`; mode pulse
+terakhir tetap terlihat terpisah sebagai `last_trigger_mode`. `detail` event relay
+bernilai 1 untuk ON dan 0 untuk OFF; `zero_cross_timeout.detail=1` berarti
+edge terlihat tetapi pulse tidak berhasil dimulai pada edge tersebut.
+
+Ring berkapasitas 24 event disalin ke RTC user memory setiap event (bukan
+flash), dan di-checkpoint ke dua slot LittleFS ber-CRC paling sering setiap
+30 detik. Setelah restart biasa, RTC memberi event terbaru; setelah daya
+terputus total, event sejak checkpoint terakhir dapat hilang. Kegagalan
+LittleFS tercermin pada `storage.diagnostics_checkpoint_ok`, dan factory reset
+menghapus ring. Endpoint ini tidak menyediakan kontrol relay dan tidak
+menampilkan password/token.
+
+Jangan menghubungkan USB-to-TTL biasa ketika P1 diberi 220 VAC. Reset reason
+dan urutan event perlu dibaca setelah uji fisik yang aman; build/source saja
+tidak membuktikan penyebab restart ataupun keberhasilan pulse pada AC.
 
 ## Login, session, dan API mutasi
 

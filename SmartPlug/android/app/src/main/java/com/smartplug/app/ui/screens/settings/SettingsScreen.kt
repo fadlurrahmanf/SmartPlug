@@ -1,5 +1,9 @@
 package com.smartplug.app.ui.screens.settings
 
+import kotlinx.coroutines.launch
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Remove
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -33,6 +37,7 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.smartplug.app.BuildConfig
 import com.smartplug.app.data.local.AppThemeMode
+import com.smartplug.app.data.local.TapSoundStyle
 import com.smartplug.app.ui.components.SmartPlugCard
 import com.smartplug.app.ui.localization.AppLanguage
 import com.smartplug.app.ui.localization.LocalAppLanguage
@@ -40,9 +45,11 @@ import com.smartplug.app.ui.localization.localized
 import com.smartplug.app.domain.model.RegisteredServer
 import com.smartplug.app.domain.model.SmartPlugDevice
 
+@OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
 @Composable
 fun SettingsScreen(
     onResetCompleted: () -> Unit,
+    onOpenDiagnostics: () -> Unit = {},
     viewModel: SettingsViewModel = hiltViewModel(),
 ) {
     val settings by viewModel.settings.collectAsStateWithLifecycle()
@@ -99,6 +106,107 @@ fun SettingsScreen(
                     label = localized(language, "Suara tap", "Tap sound"),
                     checked = settings.soundEnabled,
                     onCheckedChange = viewModel::setSoundEnabled,
+                )
+                if (settings.soundEnabled) {
+                    Text(
+                        localized(language, "Gaya suara (ketuk untuk mencoba)", "Sound style (tap to preview)"),
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(top = 8.dp),
+                    )
+                    androidx.compose.foundation.layout.FlowRow(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        modifier = Modifier.padding(top = 4.dp),
+                    ) {
+                        TapSoundStyle.entries.forEach { style ->
+                            androidx.compose.material3.FilterChip(
+                                selected = settings.soundStyle == style,
+                                onClick = { viewModel.setSoundStyle(style) },
+                                label = { Text(if (language == AppLanguage.INDONESIAN) style.labelId else style.labelEn) },
+                            )
+                        }
+                    }
+                }
+            }
+
+            SmartPlugCard {
+                KwhFormatCard(
+                    decimals = settings.kwhDecimals,
+                    onChange = viewModel::setKwhDecimals,
+                    language = language,
+                )
+            }
+
+            SmartPlugCard {
+                SettingsToggleRow(
+                    label = localized(language, "Tampilkan ringkasan harian di Beranda", "Show daily summary on Home"),
+                    checked = settings.dailySummaryEnabled,
+                    onCheckedChange = viewModel::setDailySummaryEnabled,
+                )
+            }
+
+            SmartPlugCard {
+                Text(localized(language, "Estimasi biaya", "Cost estimate"), style = MaterialTheme.typography.titleMedium)
+                SettingsToggleRow(
+                    label = localized(language, "Tampilkan biaya (Rp)", "Show cost (Rp)"),
+                    checked = settings.costEnabled,
+                    onCheckedChange = viewModel::setCostEnabled,
+                )
+                // Until the user types, show the saved tariff; afterwards show exactly what they typed.
+                var tariffText by remember { mutableStateOf<String?>(null) }
+                val shown = tariffText ?: tariffToText(settings.tariffPerKwh)
+                val parsed = shown.toDoubleOrNull()
+                val valid = parsed != null && parsed.isFinite() && parsed > 0.0
+                androidx.compose.material3.OutlinedTextField(
+                    value = shown,
+                    onValueChange = { raw ->
+                        val cleaned = raw.replace(',', '.').filter { it.isDigit() || it == '.' }
+                        if (cleaned.count { it == '.' } > 1) return@OutlinedTextField
+                        tariffText = cleaned
+                        val value = cleaned.toDoubleOrNull()
+                        viewModel.setTariffPerKwh(if (value != null && value > 0.0) value else 0.0)
+                    },
+                    label = { Text(localized(language, "Tarif per kWh (Rp)", "Tariff per kWh (Rp)")) },
+                    singleLine = true,
+                    isError = !valid,
+                    keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
+                        keyboardType = androidx.compose.ui.text.input.KeyboardType.Decimal,
+                    ),
+                    supportingText = {
+                        Text(
+                            if (valid) localized(language, "Biaya = kWh × tarif.", "Cost = kWh × tariff.")
+                            else localized(language, "Isi tarif lebih dari 0 agar estimasi aktif.", "Enter a tariff above 0 to enable the estimate."),
+                        )
+                    },
+                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                )
+            }
+
+            var showAdjustDialog by remember { mutableStateOf(false) }
+            SmartPlugCard {
+                Text("Advanced", style = MaterialTheme.typography.titleMedium)
+                androidx.compose.foundation.layout.Row(
+                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
+                        .clickable { showAdjustDialog = true },
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(localized(language, "Penyesuaian kWh", "kWh adjustment"), style = MaterialTheme.typography.bodyLarge)
+                        Text(
+                            localized(language, "Koreksi tampilan kWh per perangkat (hanya di HP ini)", "Correct the displayed kWh per device (this phone only)"),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            }
+            if (showAdjustDialog) {
+                KwhAdjustmentDialog(
+                    devices = registeredDevices,
+                    adjustments = settings.kwhAdjustments,
+                    loadRawKwh = { viewModel.rawKwh(it) },
+                    onSet = viewModel::setKwhAdjustPercent,
+                    onDismiss = { showAdjustDialog = false },
                 )
             }
 
@@ -189,12 +297,28 @@ fun SettingsScreen(
                 )
             }
 
+            val tapSequence = remember { com.smartplug.app.util.TapSequence() }
+            var showDiagnosticsGate by remember { mutableStateOf(false) }
             SmartPlugCard {
-                Text(localized(language, "Tentang", "About"), style = MaterialTheme.typography.titleMedium)
+                // Five quick taps on the title open the hidden diagnostics gate.
+                Text(
+                    localized(language, "Tentang", "About"),
+                    style = MaterialTheme.typography.titleMedium,
+                    modifier = Modifier.clickable(
+                        interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() },
+                        indication = null,
+                    ) { if (tapSequence.tap()) showDiagnosticsGate = true },
+                )
                 Text(
                     "SmartPlug ${BuildConfig.VERSION_NAME}",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            if (showDiagnosticsGate) {
+                DiagnosticsGateDialog(
+                    onDismiss = { showDiagnosticsGate = false },
+                    onUnlocked = { showDiagnosticsGate = false; onOpenDiagnostics() },
                 )
             }
         }
@@ -323,8 +447,152 @@ private fun SettingsToggleRow(label: String, checked: Boolean, onCheckedChange: 
     }
 }
 
+private fun tariffToText(tariff: Double): String = when {
+    tariff <= 0.0 -> ""
+    tariff == Math.floor(tariff) -> tariff.toLong().toString()
+    else -> tariff.toString()
+}
+
 private fun themeModeLabel(mode: AppThemeMode, language: AppLanguage): String = when (mode) {
     AppThemeMode.SYSTEM -> localized(language, "Sistem", "System")
     AppThemeMode.LIGHT -> localized(language, "Terang", "Light")
     AppThemeMode.DARK -> localized(language, "Gelap", "Dark")
+}
+
+/** Decimal-places picker for every kWh value, with a live preview instead of a plain list of buttons. */
+@Composable
+private fun KwhFormatCard(decimals: Int, onChange: (Int) -> Unit, language: AppLanguage) {
+    val sample = 12.345678
+    Text(localized(language, "Format kWh", "kWh format"), style = MaterialTheme.typography.titleMedium)
+    Text(
+        localized(language, "Jumlah angka di belakang koma untuk semua nilai kWh.", "Number of decimals for every kWh value."),
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier.padding(top = 4.dp),
+    )
+    // Live preview
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 12.dp),
+        horizontalArrangement = Arrangement.Center,
+        verticalAlignment = Alignment.Bottom,
+    ) {
+        Text(
+            com.smartplug.app.util.formatKwhValue(sample, decimals),
+            style = MaterialTheme.typography.displayMedium,
+            fontWeight = androidx.compose.ui.text.font.FontWeight.Bold,
+            fontFamily = com.smartplug.app.ui.theme.SmartPlugMono,
+        )
+        Text(
+            " kWh",
+            style = MaterialTheme.typography.titleMedium,
+            color = MaterialTheme.colorScheme.primary,
+            modifier = Modifier.padding(bottom = 8.dp),
+        )
+    }
+    Text(
+        com.smartplug.app.util.KwhFormat.pattern(decimals),
+        style = MaterialTheme.typography.titleSmall,
+        color = MaterialTheme.colorScheme.primary,
+        fontFamily = com.smartplug.app.ui.theme.SmartPlugMono,
+        modifier = Modifier.fillMaxWidth(),
+        textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+    )
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        androidx.compose.material3.FilledTonalIconButton(onClick = { onChange(decimals - 1) }, enabled = decimals > 0) {
+            androidx.compose.material3.Icon(androidx.compose.material.icons.Icons.Filled.Remove, contentDescription = localized(language, "Kurangi", "Fewer"))
+        }
+        androidx.compose.material3.Slider(
+            value = decimals.toFloat(),
+            onValueChange = { onChange(it.toInt()) },
+            valueRange = 0f..com.smartplug.app.util.KwhFormat.MAX_DECIMALS.toFloat(),
+            steps = com.smartplug.app.util.KwhFormat.MAX_DECIMALS - 1,
+            modifier = Modifier.weight(1f).padding(horizontal = 8.dp),
+        )
+        androidx.compose.material3.FilledTonalIconButton(
+            onClick = { onChange(decimals + 1) },
+            enabled = decimals < com.smartplug.app.util.KwhFormat.MAX_DECIMALS,
+        ) {
+            androidx.compose.material3.Icon(androidx.compose.material.icons.Icons.Filled.Add, contentDescription = localized(language, "Tambah", "More"))
+        }
+    }
+    Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 48.dp), horizontalArrangement = Arrangement.SpaceBetween) {
+        (0..com.smartplug.app.util.KwhFormat.MAX_DECIMALS).forEach { value ->
+            Text(
+                value.toString(),
+                style = MaterialTheme.typography.labelMedium,
+                color = if (value == decimals) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                fontWeight = if (value == decimals) androidx.compose.ui.text.font.FontWeight.Bold else null,
+            )
+        }
+    }
+    Text(
+        localized(
+            language,
+            "Dipakai di Beranda, daftar perangkat, detail SmartPlug, riwayat, tren live, dan Storage.",
+            "Used on Home, the device list, SmartPlug detail, history, live trend and Storage.",
+        ),
+        style = MaterialTheme.typography.labelSmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier.padding(top = 8.dp),
+    )
+}
+
+/** Password prompt in front of the hidden diagnostics. Wrong passwords wait a second; five in a row lock it for 30 s. */
+@Composable
+internal fun DiagnosticsGateDialog(onDismiss: () -> Unit, onUnlocked: () -> Unit) {
+    val language = LocalAppLanguage.current
+    val limiter = remember { com.smartplug.app.util.AttemptLimiter() }
+    var password by remember { mutableStateOf("") }
+    var message by remember { mutableStateOf<String?>(null) }
+    var checking by remember { mutableStateOf(false) }
+    val scope = androidx.compose.runtime.rememberCoroutineScope()
+    androidx.compose.material3.AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(localized(language, "Diagnostik", "Diagnostics")) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                androidx.compose.material3.OutlinedTextField(
+                    value = password,
+                    onValueChange = { password = it; message = null },
+                    label = { Text(localized(language, "Password", "Password")) },
+                    singleLine = true,
+                    visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
+                    isError = message != null,
+                )
+                message?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                enabled = password.isNotEmpty() && !checking,
+                onClick = {
+                    if (!limiter.canTry()) {
+                        message = localized(language, "Coba lagi sebentar lagi.", "Try again in a moment.")
+                        return@TextButton
+                    }
+                    checking = true
+                    scope.launch {
+                        val ok = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) {
+                            com.smartplug.app.util.DiagnosticsGate.verify(password)
+                        }
+                        if (ok) {
+                            limiter.recordSuccess()
+                            onUnlocked()
+                        } else {
+                            limiter.recordFailure()
+                            kotlinx.coroutines.delay(1_000)
+                            message = if (limiter.canTry()) localized(language, "Password salah.", "Wrong password.")
+                            else localized(language, "Terlalu banyak percobaan. Tunggu 30 detik.", "Too many tries. Wait 30 seconds.")
+                            password = ""
+                        }
+                        checking = false
+                    }
+                },
+            ) { Text(localized(language, "Buka", "Open")) }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text(localized(language, "Batal", "Cancel")) } },
+    )
 }

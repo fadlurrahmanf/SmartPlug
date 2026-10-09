@@ -19,6 +19,7 @@ import javax.inject.Inject
 data class HistoryUiState(
     val device: SmartPlugDevice? = null,
     val resolution: HistoryResolution = HistoryResolution.ONE_HOUR,
+    val range: HistoryRange = HistoryRange.LAST_DAY,
     val points: List<EnergyHistoryPoint> = emptyList(),
     val isLoading: Boolean = false,
     val error: String? = null,
@@ -28,6 +29,8 @@ data class HistoryUiState(
  * never asks the server for raw per-500ms samples (design.md "aplikasi tidak memuat seluruh data
  * mentah untuk menggambar grafik"). */
 enum class HistoryRange(val durationMs: Long, val resolution: HistoryResolution) {
+    LAST_5_MIN(TimeUnit.MINUTES.toMillis(5), HistoryResolution.ONE_SECOND),
+    LAST_15_MIN(TimeUnit.MINUTES.toMillis(15), HistoryResolution.ONE_SECOND),
     LAST_HOUR(TimeUnit.HOURS.toMillis(1), HistoryResolution.ONE_MINUTE),
     LAST_DAY(TimeUnit.DAYS.toMillis(1), HistoryResolution.FIVE_MINUTES),
     LAST_WEEK(TimeUnit.DAYS.toMillis(7), HistoryResolution.ONE_HOUR),
@@ -59,7 +62,7 @@ class EnergyHistoryViewModel @Inject constructor(
         safeLaunch(onError = {
             _uiState.value = _uiState.value.copy(isLoading = false, error = "Terjadi kesalahan tak terduga.")
         }) {
-            _uiState.value = _uiState.value.copy(isLoading = true, resolution = range.resolution, error = null)
+            _uiState.value = _uiState.value.copy(isLoading = true, resolution = range.resolution, range = range, error = null)
             val toMs = System.currentTimeMillis()
             val fromMs = toMs - range.durationMs
             when (val result = historyRepository.fetchHistory(device, fromMs, toMs, range.resolution)) {

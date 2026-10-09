@@ -104,3 +104,29 @@ data class ServerCommandStatusDto(
     @Json(name = "status") val status: String,
     @Json(name = "state") val state: String? = null,
 )
+
+/**
+ * GET /api/v1/status. The "storage" object is a PROPOSAL awaiting approval in a separate server
+ * task (not part of design.md yet): [ServerStorageDto.sdTotalBytes] / [ServerStorageDto.sdUsedBytes].
+ * Everything is optional so today's server, which has no such field, still parses.
+ */
+@JsonClass(generateAdapter = true)
+data class ServerStatusDto(
+    @Json(name = "storage") val storage: ServerStorageDto? = null,
+)
+
+@JsonClass(generateAdapter = true)
+data class ServerStorageDto(
+    @Json(name = "sd_total_bytes") val sdTotalBytes: Long? = null,
+    @Json(name = "sd_used_bytes") val sdUsedBytes: Long? = null,
+    /** PROPOSED: false while the server is still tallying its history file per SmartPlug. */
+    @Json(name = "history_scan_complete") val historyScanComplete: Boolean? = null,
+    @Json(name = "history_bytes_total") val historyBytesTotal: Long? = null,
+    @Json(name = "history_by_device") val historyByDevice: List<ServerDeviceStorageDto>? = null,
+)
+
+@JsonClass(generateAdapter = true)
+data class ServerDeviceStorageDto(
+    @Json(name = "device_id") val deviceId: String,
+    @Json(name = "bytes") val bytes: Long? = null,
+)

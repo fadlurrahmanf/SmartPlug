@@ -7,6 +7,8 @@ import com.smartplug.app.data.local.db.HistoryDao
 import com.smartplug.app.data.local.db.HistoryPointEntity
 import com.smartplug.app.data.local.db.LoadSignatureDao
 import com.smartplug.app.data.local.db.LoadSignatureEntity
+import com.smartplug.app.data.local.AppPreferences
+import com.smartplug.app.data.local.EnergyLimit
 import com.smartplug.app.data.local.ServerProfileStore
 import com.smartplug.app.domain.model.ApiFailure
 import com.smartplug.app.domain.model.DeviceStatus
@@ -22,6 +24,7 @@ import com.smartplug.app.domain.model.RegisteredServer
 import com.smartplug.app.domain.repository.DeviceRepository
 import com.smartplug.app.domain.repository.DeviceControlRepository
 import com.smartplug.app.domain.repository.RelayRepository
+import com.smartplug.app.util.applyEnergyAdjustment
 import com.smartplug.app.util.safeLaunch
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -54,9 +57,16 @@ data class DeviceDetailUiState(
     val memberInvitation: MemberInvitation? = null,
     val memberInvitationExpiresAtMs: Long = 0L,
     val isCreatingMemberInvitation: Boolean = false,
+    /** The normal disconnect failed; the UI offers a forced one. */
+    val serverDisconnectFailed: Boolean = false,
+    /** Why the last invitation attempt failed; kept apart from lastError, which polling overwrites. */
+    val memberInvitationError: String? = null,
     val managedMembers: List<ManagedMember> = emptyList(),
     val isLoadingManagedMembers: Boolean = false,
     val revokingMemberId: String? = null,
+    val limit: EnergyLimit = EnergyLimit(),
+    /** Incremented each time an ON request is refused because the kWh limit is reached. */
+    val limitBlockedNonce: Int = 0,
 )
 
 data class LiveMeasurementPoint(val timestampMs: Long, val measurement: ElectricalMeasurement)
@@ -77,10 +87,12 @@ class DeviceDetailViewModel @Inject constructor(
     private val historyDao: HistoryDao,
     private val loadSignatureDao: LoadSignatureDao,
     private val serverProfileStore: ServerProfileStore,
+    private val appPreferences: AppPreferences,
 ) : ViewModel() {
 
     private val deviceId: String = checkNotNull(savedStateHandle["deviceId"])
     private var lastStoredMinute: Long = Long.MIN_VALUE
+    private var lastLimitOffAtMs: Long = 0L
 
     private val _uiState = MutableStateFlow(DeviceDetailUiState())
     val uiState: StateFlow<DeviceDetailUiState> = _uiState.asStateFlow()
@@ -95,6 +107,42 @@ class DeviceDetailViewModel @Inject constructor(
                 canManageServer = canManageServer,
             )
         }
+    }
+
+    init {
+        safeLaunch {
+            appPreferences.energyLimit(deviceId).collect { limit ->
+                _uiState.value = _uiState.value.copy(limit = limit)
+            }
+        }
+    }
+
+    fun setEnergyLimit(enabled: Boolean, kwh: Double) {
+        safeLaunch { appPreferences.setEnergyLimit(deviceId, enabled, kwh) }
+    }
+
+    // Limits compare against the same corrected kWh the user sees on screen.
+    private var kwhAdjustPercent = 0.0
+
+    init {
+        safeLaunch { appPreferences.kwhAdjustPercent(deviceId).collect { kwhAdjustPercent = it } }
+    }
+
+    private fun currentKwh(): Double? = _uiState.value.measurement?.energyWh?.coerceAtLeast(0.0)?.div(1000.0)
+        ?.let { applyEnergyAdjustment(it, kwhAdjustPercent) }
+
+    /**
+     * App-side limit: while the app is open and polling, a reached limit sends OFF (rate-limited so
+     * a slow relay is not spammed). It cannot act while the app is closed, because the app never
+     * polls in the background (design.md).
+     */
+    private fun enforceLimit(measurementKwh: Double, relayOn: Boolean) {
+        val limit = _uiState.value.limit
+        if (!limit.isReached(measurementKwh) || !relayOn) return
+        val now = System.currentTimeMillis()
+        if (now - lastLimitOffAtMs < LIMIT_OFF_RETRY_MS) return
+        lastLimitOffAtMs = now
+        setRelay(false)
     }
 
     fun setLiveMode(enabled: Boolean) {
@@ -169,6 +217,12 @@ class DeviceDetailViewModel @Inject constructor(
             lastError = ((statusResult as? ApiResult.Failure)?.error ?: (measurementResult as? ApiResult.Failure)?.error)
                 ?.let(::describeError),
         )
+        if (successfulMeasurement != null) {
+            enforceLimit(
+                measurementKwh = applyEnergyAdjustment(successfulMeasurement.energyWh.coerceAtLeast(0.0) / 1000.0, kwhAdjustPercent),
+                relayOn = (statusResult as? ApiResult.Success)?.value?.relayState == RelayState.ON,
+            )
+        }
     }
 
     /**
@@ -283,7 +337,7 @@ class DeviceDetailViewModel @Inject constructor(
         measurement: ElectricalMeasurement,
     ): List<LiveMeasurementPoint> {
         val now = System.currentTimeMillis()
-        return (existing + LiveMeasurementPoint(now, measurement)).filter { it.timestampMs >= now - TimeUnit.MINUTES.toMillis(60) }
+        return (existing + LiveMeasurementPoint(now, measurement)).filter { it.timestampMs >= now - TimeUnit.MINUTES.toMillis(120) }
     }
 
     fun toggleRelay() {
@@ -293,6 +347,13 @@ class DeviceDetailViewModel @Inject constructor(
 
     fun setRelay(targetOn: Boolean) {
         val device = _uiState.value.device ?: return
+        if (targetOn) {
+            val kwh = currentKwh()
+            if (kwh != null && _uiState.value.limit.isReached(kwh)) {
+                _uiState.value = _uiState.value.copy(limitBlockedNonce = _uiState.value.limitBlockedNonce + 1)
+                return
+            }
+        }
 
         safeLaunch(onError = {
             _uiState.value = _uiState.value.copy(
@@ -386,19 +447,27 @@ class DeviceDetailViewModel @Inject constructor(
         }
     }
 
-    fun disconnectFromServer() {
+    fun dismissForceDisconnect() {
+        _uiState.value = _uiState.value.copy(serverDisconnectFailed = false)
+    }
+
+    fun disconnectFromServer(force: Boolean = false) {
         val device = _uiState.value.device ?: return
         if (!_uiState.value.canManageServer) {
             _uiState.value = _uiState.value.copy(lastError = "Hanya pemilik SmartPlug yang dapat mengubah koneksi server.")
             return
         }
         safeLaunch {
-            when (val result = deviceRepository.disconnectFromServer(device)) {
+            when (val result = deviceRepository.disconnectFromServer(device, force)) {
                 is ApiResult.Success -> _uiState.value = _uiState.value.copy(
                     device = device.copy(integrationMode = com.smartplug.app.domain.model.IntegrationMode.DIRECT, serverId = null, serverHost = null),
+                    serverDisconnectFailed = false,
                     lastError = null,
                 )
-                is ApiResult.Failure -> _uiState.value = _uiState.value.copy(lastError = describeError(result.error))
+                is ApiResult.Failure -> _uiState.value = _uiState.value.copy(
+                    serverDisconnectFailed = !force,
+                    lastError = describeError(result.error),
+                )
             }
         }
     }
@@ -420,6 +489,17 @@ class DeviceDetailViewModel @Inject constructor(
             _uiState.value = _uiState.value.copy(isRemoved = true)
         }
     }
+
+    /** PROPOSED firmware API; hidden in the UI unless the device reports the field. */
+    fun setProtection(enabled: Boolean, onSuccess: () -> Unit = {}) =
+        runControl("Pengaturan proteksi gagal disimpan.", onSuccess) { device ->
+            deviceControlRepository.setProtection(device, enabled)
+        }
+
+    fun setPowerPolicy(policy: com.smartplug.app.domain.model.PowerOnPolicy, delaySeconds: Int, onSuccess: () -> Unit = {}) =
+        runControl("Pengaturan gagal disimpan.", onSuccess) { device ->
+            deviceControlRepository.setPowerPolicy(device, policy, delaySeconds)
+        }
 
     fun resetEnergy() = runControl("Reset energi ditolak") { device -> deviceControlRepository.resetEnergy(device) }
 
@@ -449,12 +529,17 @@ class DeviceDetailViewModel @Inject constructor(
     fun createMemberInvitation() {
         val device = _uiState.value.device ?: return
         safeLaunch(onError = {
-            _uiState.value = _uiState.value.copy(isCreatingMemberInvitation = false, lastError = "Kode undangan tidak dapat dibuat.")
+            _uiState.value = _uiState.value.copy(
+                isCreatingMemberInvitation = false,
+                memberInvitationError = "Kode undangan tidak dapat dibuat.",
+                lastError = "Kode undangan tidak dapat dibuat.",
+            )
         }) {
             _uiState.value = _uiState.value.copy(
                 isCreatingMemberInvitation = true,
                 memberInvitation = null,
                 memberInvitationExpiresAtMs = 0L,
+                memberInvitationError = null,
                 lastError = null,
             )
             when (val result = deviceControlRepository.createMemberInvitation(device)) {
@@ -465,6 +550,7 @@ class DeviceDetailViewModel @Inject constructor(
                 )
                 is ApiResult.Failure -> _uiState.value = _uiState.value.copy(
                     isCreatingMemberInvitation = false,
+                    memberInvitationError = describeError(result.error),
                     lastError = describeError(result.error),
                 )
             }
@@ -541,12 +627,17 @@ class DeviceDetailViewModel @Inject constructor(
         "relay_actuation_disabled" -> "Kontrol relay dinonaktifkan pada firmware ini."
         "triple_confirmation_required" -> "Konfirmasi tiga tahap belum lengkap."
         "invalid_timer_duration" -> "Durasi timer tidak valid."
+        "invalid_power_policy", "invalid_protection" -> "Pengaturan tidak valid."
+        "not_found" -> "Firmware SmartPlug ini belum mendukung pengaturan tersebut."
+        "invite_already_active" -> "Masih ada kode undangan aktif di SmartPlug (berlaku maksimal 5 menit). Tunggu sampai kedaluwarsa, lalu buat kode baru."
+        "access_invite_temporarily_locked" -> "Pembuatan kode dikunci sementara karena terlalu banyak percobaan salah. Coba lagi sebentar."
         else -> failure.message ?: "Terjadi kesalahan (${failure.errorCode})"
     }
 
     private companion object {
         const val LOCAL_HISTORY_RESOLUTION = "local_1m"
         const val DIRECT_READ_RETRY_DELAY_MS = 150L
+        const val LIMIT_OFF_RETRY_MS = 15_000L
         val VAMPIRE_WINDOW_MS = TimeUnit.MINUTES.toMillis(15)
     }
 }

@@ -155,6 +155,7 @@ class TimerViewModelTest {
             mockk<HistoryDao>(relaxed = true),
             mockk<LoadSignatureDao>(relaxed = true),
             mockk<ServerProfileStore>(relaxed = true),
+        mockk<com.smartplug.app.data.local.AppPreferences>(relaxed = true),
         )
         dispatcher.scheduler.advanceUntilIdle()
 
@@ -189,6 +190,7 @@ class TimerViewModelTest {
         mockk<HistoryDao>(relaxed = true),
         mockk<LoadSignatureDao>(relaxed = true),
         mockk<ServerProfileStore>(relaxed = true),
+        mockk<com.smartplug.app.data.local.AppPreferences>(relaxed = true),
     )
 
     private companion object {

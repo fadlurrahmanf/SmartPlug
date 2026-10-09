@@ -21,6 +21,7 @@
 /SmartPlug/firmware/artifacts/
 /ServerSmartPlug/.pio/
 /SmartPlug/output/
+/SmartPlug/Storage/
 /SmartPlug/firmware.rar
 /SmartPlug/output/firmware-test.bin.gz
 

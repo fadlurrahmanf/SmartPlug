@@ -18,6 +18,7 @@ import com.smartplug.app.domain.repository.DeviceRepository
 import com.smartplug.app.domain.repository.HistoryRepository
 import com.smartplug.app.domain.repository.RelayRepository
 import com.smartplug.app.util.safeLaunch
+import com.smartplug.app.util.sumDaySeries
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -45,6 +46,8 @@ data class DeviceListUiState(
     val todayKwh: Map<String, Double> = emptyMap(),
     /** Summed kWh since midnight over time (epoch ms, kWh) for the Beranda chart. */
     val todaySeries: List<Pair<Long, Double>> = emptyList(),
+    /** Raw (uncorrected) per-device series, so the UI can apply each device's kWh adjustment. */
+    val todaySeriesByDevice: Map<String, List<Pair<Long, Double>>> = emptyMap(),
     /** ServerSmartPlug profiles saved on this phone. */
     val servers: List<RegisteredServer> = emptyList(),
     /** Devices whose relay command is in flight. */
@@ -67,6 +70,7 @@ class DeviceListViewModel @Inject constructor(
     private val refreshing = MutableStateFlow(false)
     private val todayKwh = MutableStateFlow<Map<String, Double>>(emptyMap())
     private val todaySeries = MutableStateFlow<List<Pair<Long, Double>>>(emptyList())
+    private val todaySeriesByDevice = MutableStateFlow<Map<String, List<Pair<Long, Double>>>>(emptyMap())
     private val servers = MutableStateFlow(serverProfileStore.all())
     private val relayBusy = MutableStateFlow<Set<String>>(emptySet())
     private var lastTodayFetchMs = 0L
@@ -82,6 +86,7 @@ class DeviceListViewModel @Inject constructor(
     private data class Extras(
         val today: Map<String, Double>,
         val series: List<Pair<Long, Double>>,
+        val seriesByDevice: Map<String, List<Pair<Long, Double>>>,
         val servers: List<RegisteredServer>,
         val busy: Set<String>,
     )
@@ -90,8 +95,11 @@ class DeviceListViewModel @Inject constructor(
         combine(deviceRepository.observeDevices(), statuses, measurements, refreshing) { devices, statusMap, measurementMap, isRefreshing ->
             Base(devices, statusMap, measurementMap, isRefreshing)
         },
-        combine(todayKwh, todaySeries, servers, relayBusy) { today, series, serverList, busy ->
-            Extras(today, series, serverList, busy)
+        combine(
+            combine(todayKwh, todaySeries, todaySeriesByDevice) { today, series, byDevice -> Triple(today, series, byDevice) },
+            combine(servers, relayBusy) { serverList, busy -> serverList to busy },
+        ) { (today, series, byDevice), (serverList, busy) ->
+            Extras(today, series, byDevice, serverList, busy)
         },
     ) { base, extras ->
         DeviceListUiState(
@@ -102,6 +110,7 @@ class DeviceListViewModel @Inject constructor(
             isRefreshing = base.isRefreshing,
             todayKwh = extras.today,
             todaySeries = extras.series,
+            todaySeriesByDevice = extras.seriesByDevice,
             servers = extras.servers,
             relayBusy = extras.busy,
         )
@@ -235,33 +244,25 @@ class DeviceListViewModel @Inject constructor(
                 }.timeInMillis
                 val result = todayKwh.value.toMutableMap()
                 val perDevice = mutableListOf<List<Pair<Long, Double>>>()
+                val byDevice = mutableMapOf<String, List<Pair<Long, Double>>>()
                 devices.forEach { device ->
                     val current = latest[device.deviceId] ?: return@forEach
                     val points = (historyRepository.fetchHistory(device, midnight, now, HistoryResolution.FIVE_MINUTES) as? ApiResult.Success)
                         ?.value.orEmpty().filter { it.timestampUtcMs >= midnight }.sortedBy { it.timestampUtcMs }
                     val first = points.firstOrNull() ?: return@forEach
                     result[device.deviceId] = ((current.energyWh - first.energyWh) / 1000.0).coerceAtLeast(0.0)
-                    perDevice += points.map { it.timestampUtcMs to ((it.energyWh - first.energyWh) / 1000.0).coerceAtLeast(0.0) } +
+                    val series = points.map { it.timestampUtcMs to ((it.energyWh - first.energyWh) / 1000.0).coerceAtLeast(0.0) } +
                         (now to result.getValue(device.deviceId))
+                    perDevice += series
+                    byDevice[device.deviceId] = series
                 }
                 todayKwh.value = result
-                todaySeries.value = sumSeries(perDevice)
+                todaySeries.value = sumDaySeries(perDevice)
+                todaySeriesByDevice.value = byDevice
             } finally {
                 todayFetchRunning = false
             }
         }
     }
 
-    /** Sums per-device cumulative series on shared 5-minute buckets, carrying each device forward. */
-    private fun sumSeries(perDevice: List<List<Pair<Long, Double>>>): List<Pair<Long, Double>> {
-        if (perDevice.isEmpty()) return emptyList()
-        val bucket = 300_000L
-        val keys = perDevice.flatMap { series -> series.map { it.first / bucket * bucket } }.toSortedSet()
-        return keys.map { key ->
-            val total = perDevice.sumOf { series ->
-                series.lastOrNull { it.first / bucket * bucket <= key }?.second ?: 0.0
-            }
-            key to total
-        }
-    }
 }

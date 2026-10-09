@@ -24,9 +24,11 @@
 #include "SmartPlugConfig.h"
 #include "SmartPlugAnomaly.h"
 #include "SmartPlugReliability.h"
+#include "SmartPlugPowerRestore.h"
 #include "SmartPlugCredentialVault.h"
 #include "SmartPlugMigration.h"
 #include "FactoryProfile.h"
+#include "SmartPlugDiagnostics.h"
 
 namespace {
 namespace energy_persist {
@@ -38,18 +40,57 @@ bool resetForFactory();
 }
 }
 
-// BL0940 drives ZX about 570 us after each AC zero crossing. The ISR does
-// only the minimum safe work; the relay coil is always driven from the loop.
+// BL0940 drives ZX about 570 us after each AC zero crossing. Coil drive is
+// armed by the main loop but starts in this ISR, so its leading edge follows
+// the actual ZX edge instead of being delayed by HTTP, MQTT, or meter work.
+// A mechanical relay's contacts still move later than its coil drive; exact
+// contact-zero switching would require a measured relay operate time and is
+// not claimed by this firmware.
+constexpr uint8_t kNoArmedRelayPin = 0xFFU;
 volatile uint32_t zeroCrossSequence = 0;
 volatile uint32_t lastZeroCrossAtUs = 0;
+volatile uint32_t zeroCrossHalfCycleUs = 0;
+volatile uint8_t zeroCrossValidIntervals = 0;
+// Learned only from completed pulses that actually started on a zero-cross
+// edge. This is a runtime diagnostic, not a scheduling source.
+uint32_t lastSuccessfulRelayZeroCrossHalfCycleUs = 0;
+bool lastRelayPulseUsedFallback = false;
+uint32_t lastZeroCrossFallbackAtMs = 0;
+const char* lastRelayCommandOutcome = "none";
+volatile uint8_t armedRelayPin = kNoArmedRelayPin;
+volatile bool armedRelayPulseStarted = false;
+volatile uint32_t armedRelayPulseStartedAtUs = 0;
+volatile uint32_t armedRelayPulseHalfCycleUs = 0;
 
 void IRAM_ATTR onZeroCross() {
   const uint32_t nowUs = micros();
   // A mains half-cycle is 8.3-10 ms. Reject contact/noise glitches that are
   // much closer together without suppressing a valid 60 Hz edge.
   if (nowUs - lastZeroCrossAtUs < 3000UL) return;
+  const uint32_t previousAtUs = lastZeroCrossAtUs;
+  const uint32_t intervalUs = nowUs - previousAtUs;
+  // Keep the latest plausible 50/60 Hz half-cycle as diagnostic analytics.
+  // This is deliberately not used to predict/drive the relay: a real ZX edge
+  // is always more accurate than a prediction based on a noisy mains period.
+  if (previousAtUs != 0U && intervalUs >= 7000UL && intervalUs <= 13000UL) {
+    zeroCrossHalfCycleUs = intervalUs;
+    if (zeroCrossValidIntervals < 3U) ++zeroCrossValidIntervals;
+  } else {
+    zeroCrossValidIntervals = 0;
+  }
   lastZeroCrossAtUs = nowUs;
   ++zeroCrossSequence;
+
+  // Only the already-configured relay GPIO is written here. No allocation,
+  // serial output, network work, or state persistence is permitted in ISR.
+  const uint8_t pin = armedRelayPin;
+  if (pin != kNoArmedRelayPin && zeroCrossValidIntervals >= 2U) {
+    digitalWrite(pin, HIGH);
+    armedRelayPulseStartedAtUs = nowUs;
+    armedRelayPulseHalfCycleUs = zeroCrossHalfCycleUs;
+    armedRelayPulseStarted = true;
+    armedRelayPin = kNoArmedRelayPin;
+  }
 }
 
 uint32_t zeroCrossSnapshot() {
@@ -57,6 +98,53 @@ uint32_t zeroCrossSnapshot() {
   const uint32_t snapshot = zeroCrossSequence;
   interrupts();
   return snapshot;
+}
+
+uint32_t zeroCrossHalfCycleSnapshot() {
+  noInterrupts();
+  const uint32_t snapshot = zeroCrossHalfCycleUs;
+  interrupts();
+  return snapshot;
+}
+
+bool zeroCrossTimingSnapshot(uint32_t& halfCycleUs) {
+  noInterrupts();
+  const uint32_t lastEdgeUs = lastZeroCrossAtUs;
+  const uint8_t validIntervals = zeroCrossValidIntervals;
+  halfCycleUs = zeroCrossHalfCycleUs;
+  interrupts();
+  // Do not advertise an old measured period as a currently available edge.
+  return lastEdgeUs != 0U && validIntervals >= 2U &&
+         uint32_t(micros() - lastEdgeUs) <= 50000UL;
+}
+
+bool armRelayPulseForZeroCross(const uint8_t pin) {
+  noInterrupts();
+  const bool canArm = armedRelayPin == kNoArmedRelayPin && !armedRelayPulseStarted;
+  if (canArm) armedRelayPin = pin;
+  interrupts();
+  return canArm;
+}
+
+bool takeZeroCrossStartedRelayPulse(uint32_t& startedAtUs,
+                                    uint32_t& halfCycleUs) {
+  noInterrupts();
+  const bool started = armedRelayPulseStarted;
+  if (started) {
+    startedAtUs = armedRelayPulseStartedAtUs;
+    halfCycleUs = armedRelayPulseHalfCycleUs;
+    armedRelayPulseStarted = false;
+  }
+  interrupts();
+  return started;
+}
+
+bool disarmRelayPulseForFallback() {
+  noInterrupts();
+  const bool startedOnEdge = armedRelayPulseStarted;
+  if (!startedOnEdge) armedRelayPin = kNoArmedRelayPin;
+  interrupts();
+  return !startedOnEdge;
 }
 
 // EEPROM bytes 0..511 are reserved for the persistent SmartPlug settings in
@@ -67,6 +155,12 @@ constexpr size_t kMqttSettingsOffset = 512;
 // Reserved EEPROM tail for the temporary 64 KiB -> 32 KiB migration handoff.
 // It is intentionally outside both the API record and the MQTT record.
 constexpr size_t kMigrationEepromOffset = 768;
+
+// Small local portal intentionally kept separate from the Android UI.  It is
+// served to a handset connected to the always-on SoftAP at 192.168.4.1, then
+// obtains the same authenticated monitoring data as other local clients.
+// Keep this compact: the ESP-07 production application slot is constrained.
+const char kLocalPortalHtml[] PROGMEM = R"HTML(<!doctype html><html lang="id"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>SmartPlug Lokal</title><style>body{margin:0;background:#081418;color:#eaf4f3;font:16px system-ui,sans-serif}.w{max-width:520px;margin:auto;padding:20px}.top{display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #294248;padding-bottom:14px}.muted{color:#93a9aa}.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px;margin:16px 0}.c,.login{background:#102329;border:1px solid #294248;border-radius:14px;padding:13px}.c span{display:block;color:#93a9aa;font-size:11px;text-transform:uppercase;letter-spacing:.08em}.c b{display:block;font-size:23px;margin-top:5px}.login{margin:16px 0}.login label{display:block;margin-bottom:8px}.login input{box-sizing:border-box;width:100%;margin-bottom:10px;padding:11px;border:1px solid #406069;border-radius:9px;background:#081418;color:#fff;font:inherit}button{border:0;border-radius:10px;padding:11px 14px;font:inherit;font-weight:700;background:#ff7a18;color:#20160c;margin:4px 6px 4px 0}button:disabled{opacity:.45}.danger{background:#4c1b22;color:#ff929c}.ok{color:#67e68d}.bad{color:#ff8790}</style><main class="w"><header class="top"><div><b>SmartPlug</b><div class="muted">Monitor lokal · 192.168.4.1</div></div><b id="state" class="muted">Belum masuk</b></header><form class="login" id="loginBox" method="post" action="/local/login"><label for="pass">Password admin</label><input id="pass" name="password" type="password" autocomplete="current-password" placeholder="Masukkan password" required><button type="submit">Masuk</button><div id="note" class="muted">Masukkan password untuk mulai memantau.</div></form><section class="grid"><div class="c"><span>Tegangan</span><b id="v">—</b></div><div class="c"><span>Arus</span><b id="i">—</b></div><div class="c"><span>Daya aktif</span><b id="p">—</b></div><div class="c"><span>Energi</span><b id="e">—</b></div><div class="c"><span>Interval zero crossing</span><b id="zx">—</b></div><div class="c"><span>Frekuensi</span><b id="freq">—</b></div><div class="c"><span>Trigger relay</span><b id="zxrelay">—</b></div><div class="c"><span>Interval saat pulse terakhir</span><b id="lastzx">—</b></div></section><button id="refresh" disabled>Refresh</button><button id="reset" class="danger" disabled>Factory reset</button><p class="muted">Factory reset menghapus Wi-Fi, akses admin, timer, jadwal, dan energi lokal.</p></main><script>let csrf='',busy=false;const x=id=>document.getElementById(id),n=(v,u,d=1)=>Number.isFinite(v)?Number(v).toFixed(d)+' '+u:'—';function msg(s,b=false){x('note').textContent=s;x('state').textContent=b?'Tidak terbaca':'Live';x('state').className=b?'bad':'ok'}function loggedIn(j){csrf=j.csrf_token;x('loginBox').style.display='none';x('refresh').disabled=false;x('reset').disabled=false;tick()}async function api(url,opt={}){if(!csrf)throw Error('login diperlukan');let h=new Headers(opt.headers||{});if(opt.method&&opt.method!=='GET')h.set('X-CSRF-Token',csrf);let r=await fetch(url,{...opt,headers:h,credentials:'same-origin'}),j=await r.json().catch(()=>({}));if(r.status===401){csrf='';x('loginBox').style.display='block';x('refresh').disabled=true;x('reset').disabled=true}if(!r.ok)throw Error(j.error||'request gagal');return j}async function load(){if(busy||!csrf)return;busy=true;try{let m=await api('/api/v1/measurements/allparameters'),q=m.electrical||{};x('v').textContent=n(q.voltage_v,'V');x('i').textContent=n(q.current_a,'A',3);x('p').textContent=n(q.active_power_w,'W');x('e').textContent=n((q.energy_wh||0)/1000,'kWh',4);let z=m.zero_cross||{};x('zx').textContent=z.valid?z.half_cycle_us+' µs / '+(z.half_cycle_us/1000).toFixed(3)+' ms':'Tidak tersedia';x('freq').textContent=z.valid?n(z.frequency_hz,'Hz',2):'—';x('zxrelay').textContent=z.waiting_for_relay_edge?'Menunggu edge':z.relay_state==='transitioning'?'Pulse berjalan':z.relay_state||'—';x('lastzx').textContent=z.last_successful_relay_half_cycle_us?z.last_successful_relay_half_cycle_us+' µs':'—';msg('Pembaruan lokal setiap 1 detik.')}catch(e){msg(e.message,true)}finally{busy=false}}async function resetDevice(){if(!confirm('Factory reset menghapus semua pengaturan. Lanjut?')||!confirm('Yakin ingin melanjutkan?')||!confirm('Konfirmasi terakhir: reset SmartPlug sekarang?'))return;try{await api('/api/v1/settings/wifi/reset',{method:'POST'});csrf='';msg('Reset dijalankan. Tunggu perangkat reboot.')}catch(e){msg('Reset ditolak: '+e.message,true)}}async function tick(){await load();if(csrf)setTimeout(tick,1000)}async function restore(){try{let r=await fetch('/api/v1/auth/session',{credentials:'same-origin'}),j=await r.json().catch(()=>({}));if(r.ok)loggedIn(j)}catch(e){msg('Browser tidak dapat memulai monitor.',true)}}x('refresh').onclick=load;x('reset').onclick=resetDevice;restore();</script></html>)HTML";
 
 
 // ===== BEGIN LatchingRelay.h =====
@@ -113,7 +207,11 @@ class LatchingRelay {
   unsigned long lastPulseEndedAt_ = 0;
   bool hasPulsed_ = false;
   bool waitingForZeroCross_ = false;
+  bool pulseUsedZeroCross_ = false;
+  uint32_t pulseHalfCycleUs_ = 0;
   ActiveCoil queuedCoil_ = ActiveCoil::kNone;
+  ActiveCoil deferredCoil_ = ActiveCoil::kNone;
+  CommandedState deferredState_ = CommandedState::kUnknown;
   uint32_t zeroCrossSequenceAtQueue_ = 0;
   unsigned long zeroCrossQueuedAtMs_ = 0;
   bool zeroCrossTimedOut_ = false;
@@ -266,12 +364,16 @@ class SmartPlugApi {
  private:
   void startNetwork();
   void serviceMdns();
+  void handleLocalPortal();
+  void handleLocalPortalLogin();
   void handleDiscovery();
   void handleCapabilities();
   void handleStatus();
   void handleLatestMeasurement();
   void handleMeasurementParameter(const char* parameter);
   void handleHealth();
+  void handleDiagnostics();
+  void handleDiagnosticsPage();
   void handleWifiSettings();
   void handleWifiReset();
   void handleFactoryReset();
@@ -419,29 +521,70 @@ void LatchingRelay::begin() {
 }
 
 void LatchingRelay::tick() {
+#if SMARTPLUG_RELAY_MODE_SSR
+  // The G3MB SSR is not latching: its input stays asserted for the entire ON
+  // state.  Its own optotriac performs zero-cross AC switching, so the old
+  // dual-coil pulse/cooldown state machine is deliberately bypassed here.
+  return;
+#else
   if (waitingForZeroCross_) {
-    if (zeroCrossSnapshot() == zeroCrossSequenceAtQueue_) {
-      // Do not wait indefinitely if AC/ZX is unavailable. In that case a
-      // relay pulse is deliberately not emitted at an arbitrary phase.
-      if (millis() - zeroCrossQueuedAtMs_ >= 25UL) {
-        waitingForZeroCross_ = false;
-        queuedCoil_ = ActiveCoil::kNone;
-        pendingState_ = CommandedState::kUnknown;
-        zeroCrossTimedOut_ = true;
-        Serial.println(F("WARN relay_zero_cross_timeout"));
-      }
+    uint32_t pulseStartedAtUs = 0;
+    uint32_t pulseHalfCycleUs = 0;
+    if (takeZeroCrossStartedRelayPulse(pulseStartedAtUs, pulseHalfCycleUs)) {
+      // GPIO was asserted by onZeroCross(), not by this loop. Keep mutable
+      // relay state in normal context while preserving the precise edge.
+      activeCoil_ = queuedCoil_;
+      queuedCoil_ = ActiveCoil::kNone;
+      waitingForZeroCross_ = false;
+      pulseUsedZeroCross_ = true;
+      pulseHalfCycleUs_ = pulseHalfCycleUs;
+      lastRelayPulseUsedFallback = false;
+      lastRelayCommandOutcome = "pulsing_zero_cross";
+      smartplug_diag::record(smartplug_diag::Event::coil_started,
+                             pendingState_ == CommandedState::kOn ? 1 : 0);
+      pulseStartedAt_ = millis();
       return;
     }
-
-    digitalWrite(queuedCoil_ == ActiveCoil::kSet ? setPin_ : resetPin_, HIGH);
+    // Allow several 50/60 Hz half-cycles for the preferred edge-triggered
+    // pulse. If no edge starts the coil, complete the accepted command via a
+    // bounded fallback instead of silently dropping the requested state.
+    if (millis() - zeroCrossQueuedAtMs_ < 100UL) return;
+    const bool edgeSeen = zeroCrossSnapshot() != zeroCrossSequenceAtQueue_;
+    if (!disarmRelayPulseForFallback()) return;  // ISR won the race; consume it next tick.
+    const uint8_t pin = queuedCoil_ == ActiveCoil::kSet ? setPin_ : resetPin_;
+    digitalWrite(pin, HIGH);
     activeCoil_ = queuedCoil_;
     queuedCoil_ = ActiveCoil::kNone;
     waitingForZeroCross_ = false;
+    pulseUsedZeroCross_ = false;
+    pulseHalfCycleUs_ = 0;
+    lastRelayPulseUsedFallback = true;
+    lastZeroCrossFallbackAtMs = millis();
+    lastRelayCommandOutcome = "pulsing_fallback";
+    smartplug_diag::record(smartplug_diag::Event::zero_cross_timeout,
+                           edgeSeen ? 1 : 0);
+    smartplug_diag::record(smartplug_diag::Event::coil_started,
+                           pendingState_ == CommandedState::kOn ? 1 : 0);
     pulseStartedAt_ = millis();
+    Serial.println(edgeSeen ? F("WARN relay_zero_cross_missed_fallback")
+                            : F("WARN relay_zero_cross_unavailable_fallback"));
     return;
   }
 
   if (activeCoil_ == ActiveCoil::kNone) {
+    if (deferredCoil_ != ActiveCoil::kNone &&
+        (!hasPulsed_ || millis() - lastPulseEndedAt_ >= cooldownMs_)) {
+      const ActiveCoil coil = deferredCoil_;
+      const CommandedState target = deferredState_;
+      deferredCoil_ = ActiveCoil::kNone;
+      deferredState_ = CommandedState::kUnknown;
+      if (!request(coil, target)) {
+        // Keep an already-accepted command pending if arming unexpectedly
+        // fails. A later tick will retry it without acknowledging completion.
+        deferredCoil_ = coil;
+        deferredState_ = target;
+      }
+    }
     return;
   }
 
@@ -452,33 +595,86 @@ void LatchingRelay::tick() {
   driveBothLow();
   activeCoil_ = ActiveCoil::kNone;
   commandedState_ = pendingState_;
+  lastRelayCommandOutcome = lastRelayPulseUsedFallback ?
+      "completed_fallback" : "completed_zero_cross";
+  smartplug_diag::record(smartplug_diag::Event::coil_completed,
+                         commandedState_ == CommandedState::kOn ? 1 : 0);
+  if (pulseUsedZeroCross_ && pulseHalfCycleUs_ >= 7000UL && pulseHalfCycleUs_ <= 13000UL) {
+    lastSuccessfulRelayZeroCrossHalfCycleUs = pulseHalfCycleUs_;
+  }
   pendingState_ = CommandedState::kUnknown;
   lastPulseEndedAt_ = millis();
   hasPulsed_ = true;
+#endif
 }
 
 bool LatchingRelay::requestOn() {
+#if SMARTPLUG_RELAY_MODE_SSR
+  return request(ActiveCoil::kSet, CommandedState::kOn);
+#else
   // Board verification: the coil named RESET in the source schematic closes
   // the load path. Keep the public command semantic aligned with the output:
   // ON connects the source to the load.
   return request(ActiveCoil::kReset, CommandedState::kOn);
+#endif
 }
 
 bool LatchingRelay::requestOff() {
+#if SMARTPLUG_RELAY_MODE_SSR
+  return request(ActiveCoil::kSet, CommandedState::kOff);
+#else
   // The source-schematic SET coil opens the load path on the tested board.
   return request(ActiveCoil::kSet, CommandedState::kOff);
+#endif
 }
 
 bool LatchingRelay::request(const ActiveCoil coil,
                             const CommandedState resultingState) {
-  if (!actuationAllowed_ || activeCoil_ != ActiveCoil::kNone || waitingForZeroCross_) {
-    return false;
+  if (!actuationAllowed_) { lastRelayCommandOutcome = "rejected_actuation_disabled"; return false; }
+#if SMARTPLUG_RELAY_MODE_SSR
+  // The external SSR input is wired as +5V -> pin 3 and SET1/Q3 -> pin 4.
+  // Q3 is a low-side driver, so HIGH on GPIO5 asserts the SSR input.  Only
+  // one output is used; resetPin_ remains held inactive.
+  if (commandedState_ == resultingState) {
+    lastRelayCommandOutcome = "already_in_state";
+    return true;
+  }
+  digitalWrite(resetPin_, LOW);
+  digitalWrite(setPin_, resultingState == CommandedState::kOn ? HIGH : LOW);
+  commandedState_ = resultingState;
+  pendingState_ = CommandedState::kUnknown;
+  lastRelayCommandOutcome = resultingState == CommandedState::kOn
+      ? "ssr_on" : "ssr_off";
+  smartplug_diag::record(resultingState == CommandedState::kOn
+      ? smartplug_diag::Event::relay_on_queued : smartplug_diag::Event::relay_off_queued);
+  smartplug_diag::record(smartplug_diag::Event::coil_completed,
+                         resultingState == CommandedState::kOn ? 1 : 0);
+  return true;
+#else
+  if (deferredCoil_ != ActiveCoil::kNone) return deferredState_ == resultingState;
+  if ((activeCoil_ != ActiveCoil::kNone || waitingForZeroCross_) &&
+      pendingState_ == resultingState) return true;
+  if (activeCoil_ != ActiveCoil::kNone || waitingForZeroCross_) {
+    deferredCoil_ = coil;
+    deferredState_ = resultingState;
+    lastRelayCommandOutcome = "queued_after_active_pulse";
+    smartplug_diag::record(resultingState == CommandedState::kOn
+        ? smartplug_diag::Event::relay_on_queued : smartplug_diag::Event::relay_off_queued, 1);
+    return true;
   }
   // Replayed MQTT/REST commands to the known state are idempotent. They do
   // not energize a coil again or reset its cooldown interval.
-  if (commandedState_ == resultingState) return true;
+  if (commandedState_ == resultingState) {
+    lastRelayCommandOutcome = "already_in_state";
+    return true;
+  }
   if (hasPulsed_ && millis() - lastPulseEndedAt_ < cooldownMs_) {
-    return false;
+    deferredCoil_ = coil;
+    deferredState_ = resultingState;
+    lastRelayCommandOutcome = "queued_during_cooldown";
+    smartplug_diag::record(resultingState == CommandedState::kOn
+        ? smartplug_diag::Event::relay_on_queued : smartplug_diag::Event::relay_off_queued, 1);
+    return true;
   }
 
   driveBothLow();
@@ -487,8 +683,21 @@ bool LatchingRelay::request(const ActiveCoil coil,
   zeroCrossTimedOut_ = false;
   zeroCrossSequenceAtQueue_ = zeroCrossSnapshot();
   zeroCrossQueuedAtMs_ = millis();
-  waitingForZeroCross_ = true;
+  waitingForZeroCross_ = armRelayPulseForZeroCross(
+      coil == ActiveCoil::kSet ? setPin_ : resetPin_);
+  if (!waitingForZeroCross_) {
+    queuedCoil_ = ActiveCoil::kNone;
+    pendingState_ = CommandedState::kUnknown;
+    lastRelayCommandOutcome = "rejected_arm_failed";
+    smartplug_diag::record(smartplug_diag::Event::failure, 1);
+    return false;
+  }
+  lastRelayCommandOutcome = "queued_waiting_zero_cross";
+  smartplug_diag::record(resultingState == CommandedState::kOn
+      ? smartplug_diag::Event::relay_on_queued : smartplug_diag::Event::relay_off_queued);
+  smartplug_diag::record(smartplug_diag::Event::zero_cross_waiting);
   return true;
+#endif
 }
 
 void LatchingRelay::driveBothLow() {
@@ -497,7 +706,12 @@ void LatchingRelay::driveBothLow() {
 }
 
 bool LatchingRelay::busy() const {
-  return activeCoil_ != ActiveCoil::kNone || waitingForZeroCross_;
+#if SMARTPLUG_RELAY_MODE_SSR
+  return false;
+#else
+  return activeCoil_ != ActiveCoil::kNone || waitingForZeroCross_ ||
+         deferredCoil_ != ActiveCoil::kNone;
+#endif
 }
 
 bool LatchingRelay::actuationAllowed() const { return actuationAllowed_; }
@@ -509,11 +723,18 @@ LatchingRelay::CommandedState LatchingRelay::commandedState() const {
 }
 
 void LatchingRelay::observeState(const CommandedState state) {
+#if SMARTPLUG_RELAY_MODE_SSR
+  // An SSR is physically OFF after boot until firmware commands it. Do not
+  // infer its state from current measurements as was done for the old relay.
+  (void)state;
+  return;
+#else
   if (activeCoil_ != ActiveCoil::kNone || state == CommandedState::kUnknown) {
     return;
   }
   commandedState_ = state;
   pendingState_ = CommandedState::kUnknown;
+#endif
 }
 
 const char* LatchingRelay::stateText() const {
@@ -2506,6 +2727,8 @@ void SmartPlugApi::begin() {
   server_.on("/api/v1/settings/mqtt", HTTP_POST,
              [this]() { handleMqttSettings(); });
 #endif
+  server_.on("/", HTTP_GET, [this]() { handleLocalPortal(); });
+  server_.on("/local/login", HTTP_POST, [this]() { handleLocalPortalLogin(); });
   server_.on("/api/v1", HTTP_GET, [this]() { handleDiscovery(); });
   server_.on("/api/v1/capabilities", HTTP_GET, [this]() { handleCapabilities(); });
   server_.on("/api/v1/status", HTTP_GET, [this]() { handleStatus(); });
@@ -2518,6 +2741,8 @@ void SmartPlugApi::begin() {
   server_.on("/api/v1/measurements/power-factor", HTTP_GET, [this]() { handleMeasurementParameter("power-factor"); });
   server_.on("/api/v1/measurements/energy", HTTP_GET, [this]() { handleMeasurementParameter("energy"); });
   server_.on("/api/v1/health", HTTP_GET, [this]() { handleHealth(); });
+  server_.on("/api/v1/diagnostics", HTTP_GET, [this]() { handleDiagnostics(); });
+  server_.on("/diagnostics", HTTP_GET, [this]() { handleDiagnosticsPage(); });
   server_.on("/api/v1/auth/login", HTTP_POST, [this]() { handleLogin(); });
   server_.on("/api/v1/auth/logout", HTTP_POST, [this]() { handleLogout(); });
   server_.on("/api/v1/auth/session", HTTP_GET, [this]() { handleSession(); });
@@ -2565,6 +2790,37 @@ void SmartPlugApi::serviceMdns() {
   Serial.print(F("INFO mdns_ready host="));
   Serial.print(host);
   Serial.println(F(".local"));
+}
+void SmartPlugApi::handleLocalPortal() {
+  server_.send_P(200, PSTR("text/html; charset=utf-8"), kLocalPortalHtml);
+}
+void SmartPlugApi::handleLocalPortalLogin() {
+  if (loginLockUntilMs_ != 0 && !reached(loginLockUntilMs_)) {
+    server_.send(429, "text/html; charset=utf-8",
+                 "<!doctype html><meta charset=utf-8><p>Login dikunci sementara. Tunggu satu menit, lalu kembali.</p><a href='/'>Kembali</a>");
+    return;
+  }
+  const String password = server_.arg("password");
+  const bool valid = constantTimeEquals(
+      sha256Hmac(password, String(persistentSettings.adminSalt)),
+      String(persistentSettings.adminPasswordHash));
+  if (!valid) {
+    ++failedLoginCount_;
+    addAuditEvent("portal_login_failed");
+    if (failedLoginCount_ >= kMaxFailedLogins) {
+      failedLoginCount_ = 0;
+      loginLockUntilMs_ = millis() + kLoginLockoutMs;
+    }
+    server_.send(401, "text/html; charset=utf-8",
+                 "<!doctype html><meta charset=utf-8><p>Password salah atau belum sesuai.</p><a href='/'>Kembali</a>");
+    return;
+  }
+  failedLoginCount_ = 0;
+  loginLockUntilMs_ = 0;
+  startSession();
+  addAuditEvent("portal_login_success");
+  server_.sendHeader("Location", "/");
+  server_.send(303, "text/plain", "");
 }
 void SmartPlugApi::handleClient() { serviceMdns(); MDNS.update(); server_.handleClient(); }
 void SmartPlugApi::printWebDiagnostics() {
@@ -2626,8 +2882,15 @@ bool SmartPlugApi::requireSession(const bool requireCsrf) {
   if (requireCsrf && !constantTimeEquals(server_.header("X-CSRF-Token"), csrfToken_)) {
     sendError(403, "csrf_invalid"); return false;
   }
+  // A first-login device still requires a password change for normal
+  // configuration.  Factory reset is an explicit destructive recovery path:
+  // it is already protected by the authenticated session, CSRF token, and the
+  // local portal's three confirmations, and must remain available when a
+  // household cannot complete its original onboarding.
   if (requireCsrf && (persistentSettings.reserved & 1U) &&
-      server_.uri() != "/api/v1/settings/access" && server_.uri() != "/api/v1/auth/logout") {
+      server_.uri() != "/api/v1/settings/access" &&
+      server_.uri() != "/api/v1/auth/logout" &&
+      server_.uri() != "/api/v1/settings/wifi/reset") {
     sendError(403, "password_change_required"); return false;
   }
   sessionExpiresAtMs_ = millis() + kSessionLifetimeMs;
@@ -2655,7 +2918,7 @@ void SmartPlugApi::handleCapabilities() {
   const char* firmwareVersion = build_config::kFirmwareVersion;
   String b(F("{\"api_version\":\"v1\",\"firmware_version\":\""));
   b += firmwareVersion;
-  b += F("\",\"features\":{\"local_dashboard\":false,\"local_api\":true,\"session_auth\":true,\"csrf_protection\":true,\"credential_storage\":\"salted_sha256_hmac\",\"wifi_provisioning\":true,\"mqtt\":");
+  b += F("\",\"features\":{\"local_dashboard\":true,\"local_api\":true,\"session_auth\":true,\"csrf_protection\":true,\"credential_storage\":\"salted_sha256_hmac\",\"wifi_provisioning\":true,\"mqtt\":");
   b += SMARTPLUG_ENABLE_MQTT ? "true" : "false";
   b += F(",\"ota_update\":false,\"relay_actuation\":");
   b += relayActuationAllowed_ ? "true" : "false";
@@ -2786,7 +3049,17 @@ void SmartPlugApi::handleLatestMeasurement() {
                               ",\"power_factor\":" + String(electrical_.powerFactor, 3) +
                               ",\"energy_wh\":" + String(electrical_.energyWhSinceBoot, 3)
                           : ",\"apparent_power_va\":0,\"power_factor\":0,\"energy_wh\":0";
-  body += "},\"raw_codes\":{\"i_rms\":" + String(raw_.currentRms) +
+  uint32_t zeroCrossHalfCycleUs = 0;
+  const bool zeroCrossTimingValid = zeroCrossTimingSnapshot(zeroCrossHalfCycleUs);
+  if (!zeroCrossTimingValid) zeroCrossHalfCycleUs = 0;
+  body += "},\"zero_cross\":{\"valid\":" + String(zeroCrossTimingValid ? "true" : "false") +
+          ",\"waiting_for_relay_edge\":" + String(armedRelayPin != kNoArmedRelayPin ? "true" : "false") +
+          ",\"relay_state\":\"" + String(relayState_) + "\"" +
+          ",\"half_cycle_us\":" + String(zeroCrossHalfCycleUs) +
+          ",\"full_cycle_us\":" + String(zeroCrossHalfCycleUs * 2UL) +
+          ",\"frequency_hz\":" + String(zeroCrossHalfCycleUs ? 500000.0F / zeroCrossHalfCycleUs : 0.0F, 2) +
+          ",\"last_successful_relay_half_cycle_us\":" +
+          String(lastSuccessfulRelayZeroCrossHalfCycleUs) + "},\"raw_codes\":{\"i_rms\":" + String(raw_.currentRms) +
           ",\"v_rms\":" + String(raw_.voltageRms) +
           ",\"active_power\":" + String(raw_.activePower) +
           ",\"cf_count\":" + String(raw_.cfCount) + "}}";
@@ -2816,6 +3089,97 @@ void SmartPlugApi::handleMeasurementParameter(const char* parameter) {
   sendJson(200, body);
 }
 void SmartPlugApi::handleHealth() { if (!requireOperationalRead()) return; const bool readerActive = hasSample_ && millis() - capturedAtMs_ <= 5000UL; String b = "{\"meter\":{\"reader_state\":\""; b += readerActive ? "active" : (hasPollResult_ ? "not_receiving_valid_data" : "awaiting_first_packet"); b += "\",\"last_valid_sample_age_ms\":"; b += hasSample_ ? String(millis() - capturedAtMs_) : "null"; b += ",\"has_poll_result\":"; b += hasPollResult_ ? "true" : "false"; b += ",\"latest_poll_valid\":"; b += hasPollResult_ ? (latestPollValid_ ? "true" : "false") : "null"; b += ",\"packets_ok\":" + String(packetsOk_) + ",\"packets_bad\":" + String(packetsBad_) + "},\"api\":\"ok\"}"; sendJson(200, b); }
+void SmartPlugApi::handleDiagnostics() {
+  if (!requireOwnerTokenBearer() && !requireSession(false)) return;
+  uint32_t halfCycleUs = 0;
+  const bool zxValid = zeroCrossTimingSnapshot(halfCycleUs);
+  const bool waiting = armedRelayPin != kNoArmedRelayPin;
+  const char* zxStatus = waiting ? "waiting" :
+      (zxValid ? "valid" :
+       (lastRelayPulseUsedFallback && millis() - lastZeroCrossFallbackAtMs <= 5000UL
+           ? "timeout" : "unavailable"));
+  String b;
+  b.reserve(4200);
+  b += F("{\"firmware_version\":\""); b += build_config::kFirmwareVersion;
+  b += F("\",\"device_id\":\""); b += deviceId();
+  b += F("\",\"uptime_ms\":"); b += String(millis());
+  b += F(",\"reset_reason\":\""); b += jsonEscape(ESP.getResetReason());
+  b += F("\",\"free_heap\":"); b += String(ESP.getFreeHeap());
+  b += F(",\"max_free_block\":"); b += String(ESP.getMaxFreeBlockSize());
+  b += F(",\"wifi\":{\"ap_enabled\":");
+  b += (WiFi.getMode() & WIFI_AP) ? "true" : "false";
+  b += F(",\"ap_ip\":\""); b += WiFi.softAPIP().toString();
+  b += F("\",\"sta_connected\":"); b += WiFi.status() == WL_CONNECTED ? "true" : "false";
+  b += F(",\"sta_ip\":\"");
+  if (WiFi.status() == WL_CONNECTED) b += WiFi.localIP().toString();
+  b += F("\"},\"integration\":{\"mode\":\"");
+#if SMARTPLUG_ENABLE_MQTT
+  b += (mqtt_ && mqtt_->mqttMode()) ? "mqtt" : "direct";
+  b += F("\",\"mqtt_connected\":");
+  b += (mqtt_ && mqtt_->connected()) ? "true" : "false";
+#else
+  b += "direct\",\"mqtt_connected\":false";
+#endif
+  b += F("},\"relay\":{\"state\":\""); b += relayState_;
+  b += F("\",\"last_command_result\":\""); b += lastRelayCommandOutcome;
+  b += F("\",\"api_command_result\":\""); b += jsonEscape(relayCommandResult_);
+  b += F("\"},\"zero_cross\":{\"status\":\""); b += zxStatus;
+  b += F("\",\"half_cycle_us\":"); b += String(halfCycleUs);
+  b += F(",\"full_cycle_us\":"); b += String(halfCycleUs * 2UL);
+  b += F(",\"frequency_hz\":");
+  b += halfCycleUs ? String(500000.0f / halfCycleUs, 2) : String("null");
+  b += F(",\"last_successful_relay_half_cycle_us\":");
+  b += String(lastSuccessfulRelayZeroCrossHalfCycleUs);
+  b += F(",\"last_trigger_mode\":\"");
+  b += lastRelayPulseUsedFallback ? "fallback" :
+      (lastSuccessfulRelayZeroCrossHalfCycleUs ? "zero_cross" : "none");
+  b += F("\"},\"bl0940\":{\"reader_state\":\"");
+  b += hasSample_ && millis() - capturedAtMs_ <= 5000UL ? "active" :
+      (hasPollResult_ ? "not_receiving_valid_data" : "awaiting_first_packet");
+  b += F("\",\"last_sample_age_ms\":");
+  b += hasSample_ ? String(millis() - capturedAtMs_) : String("null");
+  b += F(",\"packets_ok\":"); b += String(packetsOk_);
+  b += F(",\"packets_bad\":"); b += String(packetsBad_);
+  b += F("},\"storage\":{\"littlefs_ready\":");
+  b += energyPersistenceReady_ ? "true" : "false";
+  b += F(",\"energy_write_failed\":"); b += energy_persist::writeFailed ? "true" : "false";
+  b += F(",\"energy_record_corrupt\":"); b += energy_persist::corrupt ? "true" : "false";
+  b += F(",\"energy_saved_available\":"); b += energySavedAvailable_ ? "true" : "false";
+  b += F(",\"energy_saved_wh\":"); b += String(energySavedWh_, 3);
+  b += F(",\"energy_next_save_seconds\":"); b += String(energyNextSaveSeconds_);
+  b += F(",\"diagnostics_checkpoint_ok\":");
+  b += smartplug_diag::checkpointHealthy() ? "true" : "false";
+  b += F(",\"diagnostics_checkpoint_age_ms\":");
+  b += String(smartplug_diag::lastCheckpointAgeMs());
+  b += F("},\"events\":[");
+  for (uint8_t i = 0; i < smartplug_diag::count(); ++i) {
+    const auto event = smartplug_diag::newest(i);
+    if (i) b += ',';
+    b += F("{\"boot_id\":"); b += String(event.bootId);
+    b += F(",\"uptime_ms\":"); b += String(event.uptimeMs);
+    b += F(",\"event\":\"");
+    b += smartplug_diag::name(static_cast<smartplug_diag::Event>(event.event));
+    b += F("\",\"detail\":"); b += String(event.detail);
+    b += '}';
+  }
+  b += F("]}");
+  sendJson(200, b);
+}
+
+void SmartPlugApi::handleDiagnosticsPage() {
+  if (!requireOwnerTokenBearer() && !requireSession(false)) return;
+  server_.sendHeader("Cache-Control", "no-store");
+  server_.send(200, "text/html; charset=utf-8", F(
+      "<!doctype html><html><head><meta name=viewport content='width=device-width,initial-scale=1'>"
+      "<title>SmartPlug Diagnostics</title><style>body{font:14px system-ui;background:#101827;color:#e8efff;"
+      "max-width:960px;margin:auto;padding:20px}pre{white-space:pre-wrap;overflow-wrap:anywhere;"
+      "background:#1b2940;padding:16px;border-radius:12px}</style></head><body>"
+      "<h1>SmartPlug Diagnostics</h1><p>Live read-only diagnostics; refresh every 1 second.</p>"
+      "<pre id=out>Loading...</pre><script>async function refresh(){const start=Date.now();try{const r=await fetch('/api/v1/diagnostics',"
+      "{cache:'no-store'});if(!r.ok)throw Error('HTTP '+r.status);document.getElementById('out').textContent="
+      "JSON.stringify(await r.json(),null,2)}catch(e){document.getElementById('out').textContent=String(e)}"
+      "finally{setTimeout(refresh,Math.max(0,1000-(Date.now()-start)))}}refresh()</script></body></html>"));
+}
 void SmartPlugApi::handleLogin() {
   if (loginLockUntilMs_ != 0 && !reached(loginLockUntilMs_)) {
     sendError(429, "login_temporarily_locked"); return;
@@ -2885,6 +3249,7 @@ bool SmartPlugApi::factoryResetWifi() {
   if (mqtt_ != nullptr && !mqtt_->clearSigningMaterial()) return false;
 #endif
   if (!energy_persist::resetForFactory()) return false;
+  smartplug_diag::clear();
   clearSession();
   addAuditEvent("factory_reset");
   // Both profiles clear the MQTT slot as part of the same EEPROM commit.
@@ -2947,6 +3312,7 @@ void SmartPlugApi::handleTimer() {
     timerExpiryTerminalFailure_ = false;
     timerExpiryAttempts_ = 0U;
     timerExpiryRetryAtMs_ = 0UL;
+    smartplug_diag::record(smartplug_diag::Event::timer_command, 0);
     addAuditEvent("timer_reset"); sendJson(200, "{\"result\":\"timer_reset\"}"); return;
   }
   const uint32_t days = server_.arg("days").toInt();
@@ -2965,6 +3331,7 @@ void SmartPlugApi::handleTimer() {
     timerArmedSeconds_ = static_cast<uint32_t>(totalSeconds);
   }
   if (!timer_persist::save(timerDeadlineUtc_, timerArmedSeconds_)) { sendError(500, "timer_save_failed"); return; }
+  smartplug_diag::record(smartplug_diag::Event::timer_command, 1);
   timerExpiryCommandInFlight_ = false;
   timerExpiryTerminalFailure_ = false;
   timerExpiryAttempts_ = 0U;
@@ -3133,6 +3500,7 @@ void SmartPlugApi::handleSchedule() {
     sendError(400, "invalid_schedule_action"); return;
   }
   if (!saveSettings()) { sendError(500, "schedule_save_failed"); return; }
+  smartplug_diag::record(smartplug_diag::Event::schedule_command);
   addAuditEvent("schedule_changed");
   sendJson(200, scheduleJson());
 }
@@ -3831,12 +4199,13 @@ void SmartPlugApi::setRelayState(const char* relayState, bool actuationAllowed,
     }
   } else if (zeroCrossTimedOut) {
     relayCommandResult_ = "zero_cross_timeout";
-  } else if (relayCommandResult_ == "pulsing" && strcmp(relayState_, "transitioning") != 0) {
+  } else if ((relayCommandResult_ == "queued" || relayCommandResult_ == "pulsing") &&
+             strcmp(relayState_, "transitioning") != 0) {
     relayCommandResult_ = "completed";
   }
 }
 void SmartPlugApi::reportRelayCommandResult(bool accepted) {
-  relayCommandResult_ = accepted ? "pulsing" : "rejected";
+  relayCommandResult_ = accepted ? "queued" : "rejected";
 }
 // ===== END SmartPlugApi.cpp =====
 
@@ -4062,8 +4431,59 @@ unsigned long lastEnergySaveAttemptAt = 0;
 bool& energyPersistenceReady = energy_persist::ready;
 bool wifiFactoryResetInProgress = false;
 bool factoryProfileMismatch = false;
-bool relayBootInferenceComplete = false;
-smartplug_reliability::BootRelayDecision relayBootDecision;
+// Power-return policy: the last settled relay state is saved to LittleFS and
+// executed once after a short settle delay (Direct mode). In Server mode the
+// server reconciles with an ordinary signed relay command instead, so the
+// local record never drives the relay there. A missing/corrupt record means
+// OFF (fail-safe). Pure decision logic: include/SmartPlugPowerRestore.h.
+namespace relay_persist {
+constexpr const char* kSlots[] = {"/relay-a.dat", "/relay-b.dat"};
+int activeSlot = -1;
+uint32_t sequence = 0U;
+
+bool readSlot(const int slot, uint32_t& seq, bool& on) {
+  File file = LittleFS.open(kSlots[slot], "r");
+  if (!file || file.size() != sizeof(smartplug_power_restore::StateRecord)) return false;
+  smartplug_power_restore::StateRecord record = {};
+  const bool read = file.read(record.bytes, sizeof(record.bytes)) == sizeof(record.bytes);
+  file.close();
+  return read && smartplug_power_restore::decode(record, seq, on);
+}
+
+smartplug_power_restore::LoadResult load() {
+  uint32_t seqA = 0U, seqB = 0U;
+  bool onA = false, onB = false;
+  const bool validA = readSlot(0, seqA, onA);
+  const bool validB = readSlot(1, seqB, onB);
+  const auto result = smartplug_power_restore::chooseNewest(validA, seqA, onA, validB, seqB, onB);
+  if (result.valid) { activeSlot = result.slot; sequence = result.sequence; }
+  return result;
+}
+
+bool save(const bool on) {
+  const int target = smartplug_power_restore::nextSlot(activeSlot);
+  const auto record = smartplug_power_restore::encode(sequence + 1U, on);
+  File file = LittleFS.open(kSlots[target], "w");
+  if (!file) return false;
+  const bool written = file.write(record.bytes, sizeof(record.bytes)) == sizeof(record.bytes);
+  file.flush();
+  file.close();
+  uint32_t seq = 0U;
+  bool readOn = false;
+  if (!written || !readSlot(target, seq, readOn) || readOn != on) return false;
+  activeSlot = target;
+  sequence = seq;
+  return true;
+}
+}  // namespace relay_persist
+
+bool relayRestoreLoaded = false;
+// -1 = nothing to do, 1 = switch ON, 0 = switch OFF (latching relay only: its contact
+// position is unknown after boot, so a saved OFF is established with one OFF pulse).
+int8_t relayRestoreAction = -1;
+smartplug_power_restore::RestoreGate relayRestoreGate;
+smartplug_power_restore::SaveDebouncer relaySaveDebouncer;
+unsigned long relaySaveAttemptAt = 0UL;
 #if SMARTPLUG_ENABLE_MQTT
 bool mqttRelayAwaitingCompletion = false;
 bool mqttRelayTargetOn = false;
@@ -4200,7 +4620,7 @@ void processCommand(const char* command) {
     return;
   }
 
-  Serial.println(accepted ? F("OK relay_pulse_started")
+  Serial.println(accepted ? F("OK relay_command_queued")
                           : F("ERR relay_disabled_busy_or_cooling_down"));
 }
 
@@ -4243,7 +4663,6 @@ void serviceMeter() {
   if (result != smartplug_bl0940::Driver::PollResult::kNone) {
     hasMeterPollResult = true;
     latestMeterPollValid = result == smartplug_bl0940::Driver::PollResult::kValid;
-    if (!latestMeterPollValid) relayBootDecision.invalid();
     if (latestMeterPollValid) {
       lastValidMeasurement = meterMovingAverage.update(measurement);
       hasLastValidMeasurement = true;
@@ -4252,15 +4671,6 @@ void serviceMeter() {
           energyIntegrator.update(lastValidMeasurement, meterCalibration,
                                   lastValidMeasurementAt,
                                   build_config::kMaxEnergySampleGapMs);
-      // Once per boot: three consecutive valid current observations select
-      // ON or OFF, then pulse that coil. State changes only when pulse ends.
-      // Zero current is not proof of an open contact or an inactive appliance.
-      if (!relayBootInferenceComplete && !relay.busy()) {
-        const int decision = relayBootDecision.observe(measurement.currentRms > 0U);
-        if (decision >= 0) {
-          relayBootInferenceComplete = decision ? relay.requestOn() : relay.requestOff();
-        }
-      }
       standbyDetector.update(electrical, build_config::kStandbyThresholdW,
                              build_config::kStandbyDurationMs,
                              lastValidMeasurementAt);
@@ -4286,6 +4696,62 @@ void serviceMeter() {
     if (meter.requestSample()) {
       lastMeterPollAt = millis();
     }
+  }
+}
+
+void serviceRelayRestore() {
+  if (!relayRestoreLoaded) {
+    relayRestoreLoaded = true;
+    smartplug_power_restore::LoadResult record;
+    if (energyPersistenceReady) record = relay_persist::load();
+    relaySaveDebouncer.setPersisted(record.valid, record.on);
+    bool serverMode = false;
+#if SMARTPLUG_ENABLE_MQTT
+    serverMode = smartPlugMqtt.mqttMode();
+#endif
+    if (serverMode) {
+      relayRestoreAction = -1;  // the server decides and sends a signed relay command
+    } else if (smartplug_power_restore::shouldRestoreOn(record.valid, record.on)) {
+      relayRestoreAction = 1;
+    } else {
+#if SMARTPLUG_RELAY_MODE_SSR
+      relayRestoreAction = -1;  // an SSR is already OFF after boot
+#else
+      relayRestoreAction = record.valid ? 0 : -1;
+#endif
+    }
+    Serial.println(serverMode ? F("INFO power_restore_server_decides")
+                              : relayRestoreAction == 1 ? F("INFO power_restore_pending_on")
+                              : relayRestoreAction == 0 ? F("INFO power_restore_pending_off")
+                                                        : F("INFO power_restore_stay_off"));
+  }
+  if (!relayRestoreGate.done()) {
+    if (relay.busy()) return;
+    if (!relayRestoreGate.due(millis(), relayRestoreAction >= 0)) return;
+    const bool accepted = relayRestoreAction == 1 ? relay.requestOn() : relay.requestOff();
+    if (accepted) {
+      if (relayRestoreAction == 1) Serial.println(F("INFO power_restore_on"));
+    } else if (relay.actuationAllowed()) {
+      relayRestoreGate.retry();  // e.g. cooldown: try again, never skip a saved ON
+    } else {
+      Serial.println(F("WARN power_restore_blocked_actuation_disabled"));
+    }
+    return;
+  }
+  // Persist only after the restore decision, so the boot-time OFF can never overwrite a saved ON.
+  const char* state = relay.stateText();
+  const bool isOn = strcmp(state, "on") == 0;
+  const bool known = isOn || strcmp(state, "off") == 0;
+  if (!relaySaveDebouncer.observe(known, isOn, millis()) || !energyPersistenceReady) return;
+  const unsigned long now = millis();
+  if (relaySaveAttemptAt != 0UL && now - relaySaveAttemptAt < 30000UL) return;  // no flash-wear loop on failure
+  relaySaveAttemptAt = now;
+  if (relay_persist::save(isOn)) {
+    relaySaveDebouncer.saved(isOn);
+    relaySaveAttemptAt = 0UL;
+  } else {
+    smartplug_diag::record(smartplug_diag::Event::failure, 4);
+    Serial.println(F("ERR relay_state_save_failed"));
   }
 }
 
@@ -4329,14 +4795,16 @@ void serviceLocalApi() {
     }
   }
   if (smartPlugApi.takeTimerOff()) {
+    smartplug_diag::record(smartplug_diag::Event::timer_command, 2);
     const bool accepted = relay.requestOff();
     smartPlugApi.reportTimerOffRequestResult(accepted);
     Serial.println(accepted ? F("INFO timer_relay_off") : F("WARN timer_relay_off_rejected"));
   }
   bool scheduledRelayOn = false;
   if (smartPlugApi.takeScheduledRelayCommand(scheduledRelayOn)) {
+    smartplug_diag::record(smartplug_diag::Event::schedule_command,
+                           scheduledRelayOn ? 1 : 2);
     const bool accepted = scheduledRelayOn ? relay.requestOn() : relay.requestOff();
-    if (accepted) relayBootInferenceComplete = true;
     smartPlugApi.reportRelayCommandResult(accepted);
     Serial.println(accepted ? F("INFO schedule_relay_command_accepted")
                             : F("WARN schedule_relay_command_rejected"));
@@ -4344,7 +4812,6 @@ void serviceLocalApi() {
   bool requestedRelayOn = false;
   if (smartPlugApi.takeRelayCommand(requestedRelayOn)) {
     const bool accepted = requestedRelayOn ? relay.requestOn() : relay.requestOff();
-    if (accepted) relayBootInferenceComplete = true;
     smartPlugApi.reportRelayCommandResult(accepted);
     Serial.println(accepted ? F("INFO web_relay_command_accepted")
                             : F("WARN web_relay_command_rejected"));
@@ -4420,7 +4887,6 @@ void serviceMqtt() {
   if (smartPlugMqtt.takeRelayCommand(requestedRelayOn)) {
     const bool accepted = requestedRelayOn ? relay.requestOn() : relay.requestOff();
     if (accepted) {
-      relayBootInferenceComplete = true;
       mqttRelayAwaitingCompletion = true; mqttRelayTargetOn = requestedRelayOn;
     } else smartPlugMqtt.reportRelayCommandResult(requestedRelayOn, false);
   }
@@ -4612,6 +5078,12 @@ void setup() {
   } else {
     Serial.println(F("ERR energy_persistence_unavailable"));
   }
+  smartplug_diag::begin(energyPersistenceReady);
+  smartplug_diag::record(smartplug_diag::Event::boot);
+  smartplug_diag::record(smartplug_diag::Event::reset_reason,
+                         ESP.getResetInfoPtr()->reason);
+  if (!energyPersistenceReady)
+    smartplug_diag::record(smartplug_diag::Event::failure, 2);
 #if SMARTPLUG_LEGACY_FS_MIGRATION_STAGE
   // This stage never formats or writes LittleFS. A verified current slot is
   // copied to EEPROM only after normal legacy recovery has succeeded.
@@ -4677,7 +5149,24 @@ void setup() {
 
 void loop() {
   if (factoryProfileMismatch) { delay(10); return; }
+  static int8_t wifiWasConnected = -1;
+  const int8_t wifiNowConnected = WiFi.status() == WL_CONNECTED ? 1 : 0;
+  if (wifiWasConnected >= 0 && wifiWasConnected != wifiNowConnected)
+    smartplug_diag::record(wifiNowConnected ? smartplug_diag::Event::wifi_connected
+                                            : smartplug_diag::Event::wifi_disconnected);
+  wifiWasConnected = wifiNowConnected;
+#if SMARTPLUG_ENABLE_MQTT
+  static int8_t mqttWasConnected = -1;
+  const int8_t mqttNowConnected = smartPlugMqtt.connected() ? 1 : 0;
+  if (mqttWasConnected >= 0 && mqttWasConnected != mqttNowConnected)
+    smartplug_diag::record(mqttNowConnected ? smartplug_diag::Event::mqtt_connected
+                                            : smartplug_diag::Event::mqtt_disconnected);
+  mqttWasConnected = mqttNowConnected;
+#endif
   relay.tick();
+  serviceRelayRestore();
+  relay.tick();
+  if (relay.busy()) { yield(); return; }
   // Serve pending API requests before any optional meter work.
   if (relay.busy()) { yield(); return; }
   serviceLocalApi();
@@ -4708,6 +5197,7 @@ void loop() {
         Serial.print(F("INFO energy_saved_wh="));
         Serial.println(energyWh, 3);
       } else {
+        smartplug_diag::record(smartplug_diag::Event::failure, 3);
         Serial.println(F("ERR energy_save_failed"));
       }
     }
@@ -4716,6 +5206,7 @@ void loop() {
   serviceOptionalButton();
   relay.tick();
   serviceStatusLed();
+  if (!relay.busy()) smartplug_diag::tick();
   yield();
 }
 // ===== END main.cpp =====

@@ -21,13 +21,16 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.unit.dp
 import com.smartplug.app.domain.model.DailyScheduleEntry
 import com.smartplug.app.ui.theme.AccentGreen
+import com.smartplug.app.ui.theme.AccentRed
 
-/** 24 hour strip: green where the plug is scheduled ON, a blue marker for the current time. */
+/**
+ * 24 hour strip: each schedule is a single thick line at its time (green = ON, red = OFF); the
+ * thinner primary-colored line is the current time.
+ */
 @Composable
 fun ScheduleRail(entries: List<DailyScheduleEntry>, nowMinute: Int, modifier: Modifier = Modifier) {
     val track = MaterialTheme.colorScheme.surfaceVariant
     val marker = MaterialTheme.colorScheme.primary
-    val intervals = scheduleOnIntervals(entries)
     Column(modifier = modifier.fillMaxWidth()) {
         Canvas(
             modifier = Modifier
@@ -36,15 +39,18 @@ fun ScheduleRail(entries: List<DailyScheduleEntry>, nowMinute: Int, modifier: Mo
                 .clip(RoundedCornerShape(12.dp))
                 .background(track),
         ) {
-            intervals.forEach { (start, end) ->
-                drawRect(
-                    AccentGreen.copy(alpha = 0.45f),
-                    topLeft = Offset(size.width * start / 1440f, 0f),
-                    size = Size(size.width * (end - start) / 1440f, size.height),
+            entries.forEach { entry ->
+                val minute = (entry.hour * 60 + entry.minute).coerceIn(0, 1440)
+                val x = (size.width * minute / 1440f).coerceIn(4f, size.width - 4f)
+                drawLine(
+                    if (entry.turnOn) AccentGreen else AccentRed,
+                    Offset(x, 0f),
+                    Offset(x, size.height),
+                    strokeWidth = 8f,
                 )
             }
             val x = size.width * nowMinute.coerceIn(0, 1440) / 1440f
-            drawLine(marker, Offset(x, 0f), Offset(x, size.height), strokeWidth = 5f)
+            drawLine(marker, Offset(x, 0f), Offset(x, size.height), strokeWidth = 3f)
         }
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
             listOf("00", "06", "12", "18", "24").forEach {
@@ -52,33 +58,6 @@ fun ScheduleRail(entries: List<DailyScheduleEntry>, nowMinute: Int, modifier: Mo
             }
         }
     }
-}
-
-/** ON spans in minutes of the day: each ON entry lasts until the next OFF entry (wrapping midnight). */
-private fun scheduleOnIntervals(entries: List<DailyScheduleEntry>): List<Pair<Int, Int>> {
-    val sorted = entries.sortedBy { it.hour * 60 + it.minute }
-    if (sorted.isEmpty()) return emptyList()
-    val result = mutableListOf<Pair<Int, Int>>()
-    sorted.forEachIndexed { i, entry ->
-        if (!entry.turnOn) return@forEachIndexed
-        val start = entry.hour * 60 + entry.minute
-        var end = 1440
-        for (step in 1..sorted.size) {
-            val candidate = sorted[(i + step) % sorted.size]
-            if (!candidate.turnOn) {
-                val minute = candidate.hour * 60 + candidate.minute
-                end = if (i + step >= sorted.size) minute + 1440 else minute
-                break
-            }
-        }
-        if (end <= 1440) {
-            if (end > start) result += start to end
-        } else {
-            result += start to 1440
-            if (end - 1440 > 0) result += 0 to (end - 1440)
-        }
-    }
-    return result
 }
 
 /** Four-segment progress strip for the pairing flows; segments up to [current] are filled. */

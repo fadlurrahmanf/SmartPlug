@@ -6,20 +6,31 @@ import retrofit2.Response
 import retrofit2.http.FieldMap
 import retrofit2.http.FormUrlEncoded
 import retrofit2.http.GET
+import retrofit2.http.Header
 import retrofit2.http.POST
 
 /** AP-local ServerSmartPlug setup contract. Calls are made only while the app is bound to its AP. */
 interface ServerSetupApi {
     @GET("/setup/status")
-    suspend fun status(): Response<ServerSetupStatusDto>
+    suspend fun status(
+        @Header("Authorization") authorization: String = SERVER_SETUP_BASIC_AUTH,
+    ): Response<ServerSetupStatusDto>
 
     @FormUrlEncoded
     @POST("/setup")
-    suspend fun apply(@FieldMap values: Map<String, String>): Response<Unit>
+    suspend fun apply(
+        @FieldMap values: Map<String, String>,
+        @Header("Authorization") authorization: String = SERVER_SETUP_BASIC_AUTH,
+    ): Response<Unit>
 
     @POST("/setup/scan-wifi")
-    suspend fun scanWifi(): Response<ServerSetupScanWifiResponseDto>
+    suspend fun scanWifi(
+        @Header("Authorization") authorization: String = SERVER_SETUP_BASIC_AUTH,
+    ): Response<ServerSetupScanWifiResponseDto>
 }
+
+/** `admin:SmartPlugSetup`, used only while the phone is bound to the WPA2-protected setup AP. */
+private const val SERVER_SETUP_BASIC_AUTH = "Basic YWRtaW46U21hcnRQbHVnU2V0dXA="
 
 @JsonClass(generateAdapter = true)
 data class ServerSetupStatusDto(

@@ -22,6 +22,12 @@ namespace {
 constexpr char kServerVersion[] = SERVER_SMARTPLUG_VERSION;
 constexpr char kSetupApSsid[] = "ServerSmartPlug-Setup";
 constexpr char kSetupApPassword[] = "SmartPlugSetup";
+constexpr char kSetupAdminUsername[] = "admin";
+// The browser portal is protected separately from the WPA2 setup AP.  This
+// factory credential deliberately matches the documented setup AP password so
+// the Android onboarding client can authenticate on a factory-reset server.
+// It can be replaced from the authenticated portal after onboarding.
+constexpr char kFactorySetupAdminPassword[] = "SmartPlugSetup";
 // Keep commissioning radio parameters aligned with the SmartPlug provisioning AP.
 // A fixed 2.4 GHz channel avoids an AP+STA default-channel change while Android is
 // negotiating its WifiNetworkSpecifier connection.
@@ -128,6 +134,16 @@ struct DeviceRecord {
   uint32_t mqttV2Boot = 0U;
   uint32_t mqttV2LastNonce = 0U;
   uint32_t mqttV2DownNonce = 0U;
+  // Runtime-only accumulator for the per-second ("fine") history.
+  uint32_t fineWindowUtc = 0U;
+  float fineSumV = 0.0F, fineSumA = 0.0F, fineSumW = 0.0F, fineSumVa = 0.0F, fineSumPf = 0.0F;
+  uint16_t fineCount = 0U;
+  // Runtime-only "reconcile after the SmartPlug rebooted" state. `restoreTarget` is the relay
+  // state this server last knew before the reboot; see serviceBootRestore().
+  char restoreTarget[4] = {};
+  bool restorePending = false;
+  bool restoreStateSeen = false;
+  uint32_t restoreDetectedMs = 0U;
 };
 
 ServerSettings settings{};
@@ -272,6 +288,28 @@ bool mqttCredentialsConfigured() {
 
 bool applicationApiConfigured() { return strlen(settings.apiToken) >= 16; }
 
+String savedSetupAdminPassword() {
+  preferences.begin("setup-auth", true);
+  const String stored = preferences.getString("admin_password", "");
+  preferences.end();
+  return stored.isEmpty() ? String(kFactorySetupAdminPassword) : stored;
+}
+
+bool requestIsSetupAdmin() {
+  const String password = savedSetupAdminPassword();
+  if (http.authenticate(kSetupAdminUsername, password.c_str())) return true;
+  http.requestAuthentication(BASIC_AUTH, "ServerSmartPlug setup");
+  return false;
+}
+
+bool changeSetupAdminPassword(const String& password) {
+  if (!validCredentialText(password, 12, 64)) return false;
+  preferences.begin("setup-auth", false);
+  const size_t written = preferences.putString("admin_password", password);
+  preferences.end();
+  return written == password.length();
+}
+
 void eraseMqttV2Secrets();
 
 void resetSettings() {
@@ -330,6 +368,9 @@ void eraseManagedStorage() {
 
 void performFactoryReset() {
   preferences.begin("smartplug-srv", false);
+  preferences.clear();
+  preferences.end();
+  preferences.begin("setup-auth", false);
   preferences.clear();
   preferences.end();
   eraseMqttV2Secrets();
@@ -881,6 +922,16 @@ void appendEnergyResetAudit(const DeviceRecord& device, const float previousEner
   file.close();
 }
 
+// Bytes of /smartplug/history.csv that belong to each SmartPlug (RAM only). A background scan
+// (serviceHistoryScan) fills it after boot; until it reaches EOF `historyScanDone` is false and
+// appends are left for the scan to pick up, so nothing is counted twice.
+uint64_t historyBytesByDevice[kMaxDevices] = {};
+uint64_t historyBytesUnattributed = 0;
+uint32_t historyScanOffset = 0;
+bool historyScanDone = false;
+// 0 = the cached SD capacity must be recomputed on the next /status?storage=1.
+uint32_t sdCapacityCachedAtMs = 0;
+
 void appendHistory(const DeviceRecord& device, const uint32_t windowUtc,
                    const float voltageV, const float currentA,
                    const float activePowerW, const float apparentPowerVa,
@@ -888,9 +939,46 @@ void appendHistory(const DeviceRecord& device, const uint32_t windowUtc,
   if (!sdReady || windowUtc == 0U) return;
   File file = SD.open(kHistoryPath, FILE_WRITE);
   if (!file) return;
-  file.printf("%lu,%s,%.3f,%.4f,%.2f,%.2f,%.3f,%.3f\n",
+  const size_t written = file.printf("%lu,%s,%.3f,%.4f,%.2f,%.2f,%.3f,%.3f\n",
               static_cast<unsigned long>(windowUtc), device.id, voltageV, currentA,
               activePowerW, apparentPowerVa, powerFactor, energyWh);
+  file.close();
+  if (historyScanDone && &device >= devices && &device < devices + kMaxDevices) {
+    historyBytesByDevice[&device - devices] += written;
+  }
+}
+
+// Reads at most a few dozen history lines per call, so a multi-megabyte file never stalls the
+// broker or the HTTP server. Lines are attributed by the device id in their second CSV field.
+void serviceHistoryScan() {
+  if (historyScanDone || !sdReady) return;
+  if (!SD.exists(kHistoryPath)) { historyScanDone = true; return; }
+  File file = SD.open(kHistoryPath, FILE_READ);
+  if (!file) return;
+  if (!file.seek(historyScanOffset)) { file.close(); historyScanOffset = 0; return; }
+  for (uint8_t lines = 0; lines < 40; ++lines) {
+    if (!file.available()) { historyScanDone = true; break; }
+    const String line = file.readStringUntil('\n');
+    const size_t lineBytes = line.length() + 1U;
+    // Every record ends with '\n'; a line that would run past EOF is still being written, so
+    // leave it (offset unchanged) for the next pass.
+    if (static_cast<uint64_t>(historyScanOffset) + lineBytes > file.size()) break;
+    historyScanOffset += static_cast<uint32_t>(lineBytes);
+    const int first = line.indexOf(',');
+    const int second = first < 0 ? -1 : line.indexOf(',', first + 1);
+    bool attributed = false;
+    if (first >= 0 && second > first) {
+      const String id = line.substring(first + 1, second);
+      for (size_t i = 0; i < kMaxDevices; ++i) {
+        if (devices[i].used && id == devices[i].id) {
+          historyBytesByDevice[i] += lineBytes;
+          attributed = true;
+          break;
+        }
+      }
+    }
+    if (!attributed) historyBytesUnattributed += lineBytes;
+  }
   file.close();
 }
 
@@ -924,6 +1012,221 @@ void addAggregateSample(DeviceRecord& device) {
   device.sumApparentPowerVa += device.apparentPowerVa;
   device.sumPowerFactor += device.powerFactor;
   if (device.aggregateCount < UINT16_MAX) ++device.aggregateCount;
+}
+
+// ---- Per-second ("fine") history -------------------------------------------------------------
+// PROPOSED (not yet in design.md). Rows go to /smartplug/s/<device_id>/<yyyymmdd>.csv (UTC day),
+// one file per device and day, kept for kFineRetentionDays. Rows are queued in RAM and written in
+// one batch every kFineFlushIntervalMs, so a flush opens each file once no matter how many rows it
+// carries. The sampling step (1, 2, 5, 10 s) stretches automatically when a flush gets slow, which
+// is how the server stays responsive as the number of SmartPlugs grows. The per-minute file above
+// stays the source for long ranges (5m/1h/1d).
+constexpr char kFineRoot[] = "/smartplug/s";
+constexpr uint32_t kFineRetentionDays = 30U;
+constexpr uint32_t kFineFlushIntervalMs = 10000UL;
+constexpr size_t kFineQueueCapacity = 160;
+constexpr uint8_t kFineLadder[] = {1, 2, 5, 10};
+constexpr size_t kFineMaxFilesPerDevice = 64;
+
+struct FineRow {
+  uint32_t utc;
+  float v, a, w, va, pf, e;
+  uint8_t device;
+  bool written;
+};
+FineRow fineQueue[kFineQueueCapacity];
+size_t fineQueueCount = 0;
+uint32_t fineDropped = 0;
+uint32_t fineLastFlushMs = 0;
+uint8_t fineLadderIndex = 0;
+uint8_t fineFastFlushes = 0;
+bool fineInitDone = false;
+uint32_t fineLastPruneDay = 0;
+uint64_t fineBytesByDevice[kMaxDevices] = {};
+
+void fineDayText(const uint32_t utc, char (&out)[9]) {
+  time_t t = static_cast<time_t>(utc);
+  struct tm parts;
+  gmtime_r(&t, &parts);
+  snprintf(out, sizeof(out), "%04d%02d%02d", parts.tm_year + 1900, parts.tm_mon + 1, parts.tm_mday);
+}
+
+String fineDeviceDir(const char* id) { return String(kFineRoot) + "/" + id; }
+
+// Lists a device's day files (name only, e.g. "20261009.csv") with their sizes.
+size_t listFineFiles(const char* id, String (&names)[kFineMaxFilesPerDevice],
+                     uint32_t (&sizes)[kFineMaxFilesPerDevice]) {
+  size_t count = 0;
+  const String dirPath = fineDeviceDir(id);
+  if (!sdReady || !SD.exists(dirPath)) return 0;
+  File dir = SD.open(dirPath);
+  if (!dir) return 0;
+  while (count < kFineMaxFilesPerDevice) {
+    File entry = dir.openNextFile();
+    if (!entry) break;
+    if (!entry.isDirectory()) {
+      String name = entry.name();
+      const int slash = name.lastIndexOf('/');
+      if (slash >= 0) name = name.substring(slash + 1);
+      names[count] = name;
+      sizes[count] = static_cast<uint32_t>(entry.size());
+      ++count;
+    }
+    entry.close();
+  }
+  dir.close();
+  return count;
+}
+
+void enqueueFineRow(DeviceRecord& device) {
+  if (device.fineCount == 0U || device.fineWindowUtc == 0U) return;
+  const float divisor = static_cast<float>(device.fineCount);
+  if (fineQueueCount < kFineQueueCapacity && &device >= devices && &device < devices + kMaxDevices) {
+    fineQueue[fineQueueCount++] = {device.fineWindowUtc, device.fineSumV / divisor, device.fineSumA / divisor,
+                                   device.fineSumW / divisor, device.fineSumVa / divisor,
+                                   device.fineSumPf / divisor, device.energyWh,
+                                   static_cast<uint8_t>(&device - devices), false};
+  } else {
+    ++fineDropped;
+  }
+  device.fineSumV = device.fineSumA = device.fineSumW = device.fineSumVa = device.fineSumPf = 0.0F;
+  device.fineCount = 0U;
+}
+
+void addFineSample(DeviceRecord& device) {
+  const uint32_t now = currentUtc();
+  if (now == 0U) return;
+  const uint32_t step = kFineLadder[fineLadderIndex];
+  const uint32_t window = now - (now % step);
+  if (device.fineWindowUtc == 0U) device.fineWindowUtc = window;
+  if (window != device.fineWindowUtc) {
+    enqueueFineRow(device);
+    device.fineWindowUtc = window;
+  }
+  device.fineSumV += device.voltageV;
+  device.fineSumA += device.currentA;
+  device.fineSumW += device.activePowerW;
+  device.fineSumVa += device.apparentPowerVa;
+  device.fineSumPf += device.powerFactor;
+  if (device.fineCount < UINT16_MAX) ++device.fineCount;
+}
+
+void flushFineQueue() {
+  if (fineQueueCount == 0 || !sdReady) return;
+  const uint32_t startedMs = millis();
+  if (!SD.exists(kFineRoot)) SD.mkdir(kFineRoot);
+  for (size_t i = 0; i < fineQueueCount; ++i) {
+    if (fineQueue[i].written) continue;
+    const uint8_t dev = fineQueue[i].device;
+    char day[9];
+    fineDayText(fineQueue[i].utc, day);
+    const String dir = fineDeviceDir(devices[dev].id);
+    if (!SD.exists(dir)) SD.mkdir(dir);
+    File file = SD.open(dir + "/" + day + ".csv", FILE_APPEND);
+    if (!file) break;  // keep the rest queued and retry on the next flush
+    for (size_t j = i; j < fineQueueCount; ++j) {
+      if (fineQueue[j].written || fineQueue[j].device != dev) continue;
+      char rowDay[9];
+      fineDayText(fineQueue[j].utc, rowDay);
+      if (strcmp(rowDay, day) != 0) continue;
+      const size_t n = file.printf("%lu,%.3f,%.4f,%.2f,%.2f,%.3f,%.3f\n",
+                                   static_cast<unsigned long>(fineQueue[j].utc), fineQueue[j].v, fineQueue[j].a,
+                                   fineQueue[j].w, fineQueue[j].va, fineQueue[j].pf, fineQueue[j].e);
+      fineBytesByDevice[dev] += n;
+      fineQueue[j].written = true;
+    }
+    file.close();
+  }
+  size_t kept = 0;
+  for (size_t i = 0; i < fineQueueCount; ++i) {
+    if (!fineQueue[i].written) fineQueue[kept++] = fineQueue[i];
+  }
+  fineQueueCount = kept;
+
+  // Self-tuning cadence: a slow flush means the SD card (or the number of SmartPlugs) cannot keep
+  // up at this step, so sample less often; many fast flushes in a row allow going back down.
+  const uint32_t duration = millis() - startedMs;
+  if (duration > 150UL && static_cast<size_t>(fineLadderIndex) + 1U < sizeof(kFineLadder)) {
+    ++fineLadderIndex;
+    fineFastFlushes = 0;
+    Serial.printf("INFO fine_history_step_s=%u flush_ms=%lu\n", static_cast<unsigned>(kFineLadder[fineLadderIndex]),
+                  static_cast<unsigned long>(duration));
+  } else if (duration < 40UL) {
+    if (++fineFastFlushes >= 30U && fineLadderIndex > 0) {
+      --fineLadderIndex;
+      fineFastFlushes = 0;
+      Serial.printf("INFO fine_history_step_s=%u flush_ms=%lu\n", static_cast<unsigned>(kFineLadder[fineLadderIndex]),
+                    static_cast<unsigned long>(duration));
+    }
+  } else {
+    fineFastFlushes = 0;
+  }
+}
+
+void pruneFineFiles(const uint32_t utc) {
+  if (!sdReady || utc <= kFineRetentionDays * 86400UL) return;
+  char cutoff[9];
+  fineDayText(utc - kFineRetentionDays * 86400UL, cutoff);
+  static String names[kFineMaxFilesPerDevice];
+  static uint32_t sizes[kFineMaxFilesPerDevice];
+  for (size_t d = 0; d < kMaxDevices; ++d) {
+    if (!devices[d].used) continue;
+    const size_t count = listFineFiles(devices[d].id, names, sizes);
+    for (size_t i = 0; i < count; ++i) {
+      if (names[i].length() < 8 || names[i].substring(0, 8) >= String(cutoff)) continue;
+      if (SD.remove(fineDeviceDir(devices[d].id) + "/" + names[i])) {
+        fineBytesByDevice[d] = fineBytesByDevice[d] > sizes[i] ? fineBytesByDevice[d] - sizes[i] : 0U;
+      }
+    }
+  }
+}
+
+// Removes every per-second file (history reset). Returns the bytes freed.
+uint64_t eraseFineFiles() {
+  uint64_t freed = 0;
+  static String names[kFineMaxFilesPerDevice];
+  static uint32_t sizes[kFineMaxFilesPerDevice];
+  for (size_t d = 0; d < kMaxDevices; ++d) {
+    if (!devices[d].used) continue;
+    const size_t count = listFineFiles(devices[d].id, names, sizes);
+    for (size_t i = 0; i < count; ++i) {
+      if (SD.remove(fineDeviceDir(devices[d].id) + "/" + names[i])) freed += sizes[i];
+    }
+  }
+  memset(fineBytesByDevice, 0, sizeof(fineBytesByDevice));
+  fineQueueCount = 0;
+  for (DeviceRecord& device : devices) {
+    device.fineSumV = device.fineSumA = device.fineSumW = device.fineSumVa = device.fineSumPf = 0.0F;
+    device.fineCount = 0U;
+    device.fineWindowUtc = 0U;
+  }
+  return freed;
+}
+
+void serviceFineHistory() {
+  if (!sdReady) return;
+  if (!fineInitDone) {
+    fineInitDone = true;
+    static String names[kFineMaxFilesPerDevice];
+    static uint32_t sizes[kFineMaxFilesPerDevice];
+    for (size_t d = 0; d < kMaxDevices; ++d) {
+      if (!devices[d].used) continue;
+      const size_t count = listFineFiles(devices[d].id, names, sizes);
+      uint64_t total = 0;
+      for (size_t i = 0; i < count; ++i) total += sizes[i];
+      fineBytesByDevice[d] = total;
+    }
+  }
+  const uint32_t nowMs = millis();
+  if (nowMs - fineLastFlushMs >= kFineFlushIntervalMs || fineQueueCount + 16U >= kFineQueueCapacity) {
+    fineLastFlushMs = nowMs;
+    flushFineQueue();
+  }
+  const uint32_t utc = currentUtc();
+  if (utc != 0U && utc / 86400UL != fineLastPruneDay) {
+    fineLastPruneDay = utc / 86400UL;
+    pruneFineFiles(utc);
+  }
 }
 
 bool replaceFileAtomically(const char* temporaryPath, const char* activePath,
@@ -1519,6 +1822,7 @@ void handleAllParameters(DeviceRecord& device, const String& payload) {
   device.lastSeenMs = millis();
   device.lastSeenUtc = currentUtc();
   addAggregateSample(device);
+  addFineSample(device);
   indexDirty = true;
   snapshotDirty = true;
 }
@@ -2221,7 +2525,7 @@ void handleAllParameters(DeviceRecord& device, const String& payload) {
   }
   device.calibrated = document["calibrated"] | false;
   device.online = true; device.lastSeenMs = millis(); device.lastSeenUtc = currentUtc();
-  addAggregateSample(device); indexDirty = true; snapshotDirty = true;
+  addAggregateSample(device); addFineSample(device); indexDirty = true; snapshotDirty = true;
 }
 
 void handleMqttApplicationMessage(const String& topic, const String& payload) {
@@ -2281,6 +2585,7 @@ void handleMqttApplicationMessage(const String& topic, const String& payload) {
     if (relay.isEmpty()) relay = jsonField(payload, "state");
     if (relay == "on" || relay == "off" || relay == "unknown") {
       copyText(device->relayState, relay);
+      if (device->restorePending) device->restoreStateSeen = true;
       startArmedTimerAfterRelayOn(*device);
       indexDirty = true;
       snapshotDirty = true;
@@ -2305,6 +2610,16 @@ void handleMqttV2ApplicationMessage(const String& topic, const String& topicDevi
         millis() - device->lastSeenMs <= kDeviceOfflineTimeoutMs) {
       recordMqttReject("v2_boot_active");
       return;
+    }
+    // Only a reboot this server run actually witnessed (an earlier epoch was seen) counts; a
+    // server restart must never replay stale SD state onto a device that kept running.
+    const bool witnessedReboot = device->mqttV2Seen;
+    if (witnessedReboot && (strcmp(device->relayState, "on") == 0 || strcmp(device->relayState, "off") == 0)) {
+      copyLiteral(device->restoreTarget, device->relayState);
+      device->restorePending = true;
+      device->restoreStateSeen = false;
+      device->restoreDetectedMs = millis();
+      Serial.printf("INFO reconcile_after_boot_detected id=%s target=%s\n", device->id, device->restoreTarget);
     }
     device->mqttV2Seen = true;
     device->mqttV2Boot = boot;
@@ -2442,6 +2757,53 @@ void serviceTimers() {
   }
 }
 
+// After a SmartPlug reboot witnessed by this server run, return the relay to the state this server
+// last knew (the SmartPlug itself does not self-restore in Server mode). It is an ordinary signed
+// relay command, sent at most once per boot, and never overrides a newer user/timer/schedule
+// command or an expired timer. Without NTP time the timer check is skipped, not guessed.
+constexpr uint32_t kRestoreSettleMs = 4000UL;
+constexpr uint32_t kRestoreGiveUpMs = 60000UL;
+
+void serviceBootRestore() {
+  const uint32_t nowMs = millis();
+  for (DeviceRecord& device : devices) {
+    if (!device.used || !device.restorePending) continue;
+    const uint32_t waited = nowMs - device.restoreDetectedMs;
+    if (waited > kRestoreGiveUpMs) {
+      device.restorePending = false;
+      Serial.printf("WARN reconcile_after_boot_expired id=%s\n", device.id);
+      continue;
+    }
+    if (waited < kRestoreSettleMs || !device.restoreStateSeen) continue;
+    if (!deviceHasFreshTelemetry(device, nowMs) || strcmp(device.commandStatus, "queued") == 0) continue;
+    if (device.commandCreatedAtMs != 0U && device.commandCreatedAtMs >= device.restoreDetectedMs) {
+      device.restorePending = false;
+      Serial.printf("INFO reconcile_after_boot_skipped id=%s reason=newer_command\n", device.id);
+      continue;
+    }
+    bool targetOn = strcmp(device.restoreTarget, "on") == 0;
+    const uint32_t utc = currentUtc();
+    if (device.timerDeadlineUtc != 0U && utc != 0U && utc >= device.timerDeadlineUtc) targetOn = false;
+    device.restorePending = false;  // once per boot
+    const bool reportedOn = strcmp(device.relayState, "on") == 0;  // "unknown" counts as off
+    if (reportedOn == targetOn) {
+      Serial.printf("INFO reconcile_after_boot_ok id=%s state=%s\n", device.id, targetOn ? "on" : "off");
+      continue;
+    }
+    ++commandCounter;
+    const String commandId = String("restore-") + String(nowMs) + "-" + String(commandCounter);
+    copyText(device.commandId, commandId);
+    copyLiteral(device.commandState, targetOn ? "on" : "off");
+    copyLiteral(device.commandStatus, "queued");
+    device.commandCreatedAtMs = nowMs;
+    device.commandResolvedAtMs = 0U;
+    indexDirty = true;
+    Serial.printf("INFO reconcile_after_boot id=%s target=%s reported=%s\n", device.id,
+                  targetOn ? "on" : "off", reportedOn ? "on" : "off");
+    publishBrokerMessage(String("smartplug/") + device.id + "/cmd/relay", targetOn ? "on" : "off", false, 0U);
+  }
+}
+
 void serviceSchedules() {
   const uint32_t now = currentUtc();
   if (now == 0U) return;
@@ -2554,13 +2916,46 @@ void handleHealth() {
                 "}}");
 }
 
+// PROPOSED (not yet in design.md): sd_total_bytes / sd_used_bytes in "storage", only when the
+// request carries ?storage=1. Computing used space walks the FAT, which can block for seconds on a
+// large card, so the result is cached for five minutes and never computed for plain status polls.
+String sdCapacityJson() {
+  static uint64_t cachedTotal = 0;
+  static uint64_t cachedUsed = 0;
+  if (!sdReady || !http.hasArg("storage")) return String();
+  const uint32_t now = millis();
+  if (sdCapacityCachedAtMs == 0U || now - sdCapacityCachedAtMs > 300000UL) {
+    cachedTotal = SD.totalBytes();
+    cachedUsed = SD.usedBytes();
+    sdCapacityCachedAtMs = now == 0U ? 1U : now;
+  }
+  uint64_t historyTotal = historyBytesUnattributed;
+  String perDevice = "[";
+  bool first = true;
+  for (size_t i = 0; i < kMaxDevices; ++i) {
+    if (!devices[i].used) continue;
+    const uint64_t deviceBytes = historyBytesByDevice[i] + fineBytesByDevice[i];
+    historyTotal += deviceBytes;
+    if (!first) perDevice += ',';
+    first = false;
+    perDevice += String("{\"device_id\":\"") + devices[i].id + "\",\"bytes\":" +
+                 String(static_cast<unsigned long long>(deviceBytes)) + "}";
+  }
+  perDevice += "]";
+  return String(",\"sd_total_bytes\":") + String(static_cast<unsigned long long>(cachedTotal)) +
+         ",\"sd_used_bytes\":" + String(static_cast<unsigned long long>(cachedUsed)) +
+         ",\"history_scan_complete\":" + (historyScanDone ? "true" : "false") +
+         ",\"history_bytes_total\":" + String(static_cast<unsigned long long>(historyTotal)) +
+         ",\"history_by_device\":" + perDevice;
+}
+
 void handleStatus() {
   if (!requestIsAuthorized()) return;
   sendJson(200, String("{\"server_version\":\"") + kServerVersion +
                 "\",\"configured\":" + (settingsReady ? "true" : "false") +
                 ",\"mqtt_broker\":{\"port\":1883,\"credentials_configured\":" +
                 (mqttCredentialsConfigured() ? "true" : "false") + "},\"storage\":{\"sd_ready\":" +
-                (sdReady ? "true" : "false") + "},\"network\":{\"station_connected\":" +
+                (sdReady ? "true" : "false") + sdCapacityJson() + "},\"network\":{\"station_connected\":" +
                 (WiFi.status() == WL_CONNECTED ? "true" : "false") +
                 ",\"station_ip\":\"" + stationIpText() + "\",\"access_point_ssid\":\"" +
                 kSetupApSsid + "\",\"access_point_ip\":\"" + WiFi.softAPIP().toString() +
@@ -2596,6 +2991,7 @@ String requestPathPart(const uint8_t index) {
 }
 
 uint32_t historyResolutionSeconds(const String& resolution) {
+  if (resolution == "1s") return 1U;
   if (resolution == "1m") return 60U;
   if (resolution == "5m") return 300U;
   if (resolution == "30m") return 1800U;
@@ -2604,9 +3000,64 @@ uint32_t historyResolutionSeconds(const String& resolution) {
   return 0U;
 }
 
+// PROPOSED: resolution=1s serves the per-second files (max one hour per request). Rows that are
+// still waiting in the RAM queue are included, so the newest points are not up to 10 s late.
+void handleFineHistory(const DeviceRecord& device) {
+  const uint32_t nowUtc = currentUtc();
+  const uint32_t to = http.hasArg("to") ? strtoul(http.arg("to").c_str(), nullptr, 10) : nowUtc;
+  const uint32_t from = http.hasArg("from") ? strtoul(http.arg("from").c_str(), nullptr, 10)
+                                            : (to > 300U ? to - 300U : 0U);
+  if (to < from || to - from > 3600U) { sendError(400, "range_too_large_for_resolution"); return; }
+  http.sendHeader("Access-Control-Allow-Origin", "*");
+  http.sendHeader("Access-Control-Allow-Headers", "Authorization, X-API-Key, Content-Type");
+  http.sendHeader("Cache-Control", "no-store");
+  http.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  http.send(200, "application/json", "");
+  http.sendContent(String("{\"device_id\":\"") + device.id + "\",\"resolution\":\"1s\",\"energy_reset_utc\":" +
+                   String(device.lastEnergyResetUtc) + ",\"points\":[");
+  bool sent = false;
+  auto emit = [&](const unsigned long timestamp, const float v, const float a, const float w,
+                  const float va, const float pf, const float e) {
+    if (sent) http.sendContent(",");
+    http.sendContent(String("{\"timestamp_utc_ms\":") + String(static_cast<uint64_t>(timestamp) * 1000ULL) +
+      ",\"voltage_v\":" + jsonNumber(v, 3) + ",\"current_a\":" + jsonNumber(a, 4) +
+      ",\"active_power_w\":" + jsonNumber(w, 2) + ",\"apparent_power_va\":" + jsonNumber(va, 2) +
+      ",\"power_factor\":" + jsonNumber(pf, 3) + ",\"energy_wh\":" + jsonNumber(e, 3) + "}");
+    sent = true;
+  };
+  uint32_t lastEmitted = 0U;
+  if (sdReady && nowUtc != 0U) {
+    for (uint32_t day = from / 86400UL; day <= to / 86400UL; ++day) {
+      char dayText[9];
+      fineDayText(day * 86400UL, dayText);
+      const String path = fineDeviceDir(device.id) + "/" + dayText + ".csv";
+      if (!SD.exists(path)) continue;
+      File file = SD.open(path, FILE_READ);
+      while (file && file.available()) {
+        const String line = file.readStringUntil('\n');
+        unsigned long timestamp = 0;
+        float v = 0, a = 0, w = 0, va = 0, pf = 0, e = 0;
+        if (sscanf(line.c_str(), "%lu,%f,%f,%f,%f,%f,%f", &timestamp, &v, &a, &w, &va, &pf, &e) != 7) continue;
+        if (timestamp < from || timestamp > to) continue;
+        emit(timestamp, v, a, w, va, pf, e);
+        lastEmitted = static_cast<uint32_t>(timestamp);
+      }
+      if (file) file.close();
+    }
+  }
+  const size_t deviceIndex = &device - devices;
+  for (size_t i = 0; i < fineQueueCount; ++i) {
+    const FineRow& row = fineQueue[i];
+    if (row.device != deviceIndex || row.written || row.utc < from || row.utc > to || row.utc <= lastEmitted) continue;
+    emit(row.utc, row.v, row.a, row.w, row.va, row.pf, row.e);
+  }
+  http.sendContent("]}");
+}
+
 void handleHistory(const DeviceRecord& device) {
   if (!sdReady) { sendError(503, "sd_card_unavailable"); return; }
   const String resolutionText = http.hasArg("resolution") ? http.arg("resolution") : "1m";
+  if (resolutionText == "1s") { handleFineHistory(device); return; }
   const uint32_t resolution = historyResolutionSeconds(resolutionText);
   if (resolution == 0U) { sendError(400, "invalid_resolution"); return; }
   const uint32_t from = http.hasArg("from") ? strtoul(http.arg("from").c_str(), nullptr, 10) : 0U;
@@ -2880,6 +3331,7 @@ void handleDeviceRoute() {
     if (state != "on" && state != "off") { sendError(400, "invalid_relay_state"); return; }
     if (!device->online) { sendError(409, "device_offline"); return; }
     if (strcmp(device->commandStatus, "queued") == 0) { sendError(409, "command_pending"); return; }
+    device->restorePending = false;  // an explicit user command always wins over a reconcile
     ++commandCounter;
     const String commandId = String("cmd-") + String(millis()) + "-" + String(commandCounter);
     copyText(device->commandId, commandId);
@@ -2976,6 +3428,7 @@ void handleMqttAuthRoute() {
 }
 
 void handleSetupStatus() {
+  if (!requestIsSetupAdmin()) return;
   sendJson(200, String("{\"access_point\":{\"ssid\":\"") + kSetupApSsid +
                 "\",\"ip\":\"" + WiFi.softAPIP().toString() +
                 "\"},\"station\":{\"configured\":" +
@@ -2988,6 +3441,7 @@ void handleSetupStatus() {
 }
 
 void handleSetupScanWifi() {
+  if (!requestIsSetupAdmin()) return;
   // Keep the setup AP online while the station radio scans; the Android app remains bound to
   // that AP and receives this response as the SmartPlug pairing flow does.
   const int count = WiFi.scanNetworks(/*async=*/false, /*show_hidden=*/true);
@@ -3032,12 +3486,42 @@ void handleServerFactoryReset() {
   sendJson(202, "{\"result\":\"factory_reset_accepted\"}");
 }
 
+// Browser recovery path for a household that has lost the app/API token.  It
+// is deliberately limited to the commissioning SoftAP and still requires the
+// same explicit three confirmations as the application flow.
+bool requestComesFromSetupAp() {
+  const IPAddress remote = http.client().remoteIP();
+  const IPAddress ap = WiFi.softAPIP();
+  return remote[0] == ap[0] && remote[1] == ap[1] && remote[2] == ap[2];
+}
+
+void handleSetupFactoryReset() {
+  if (!requestComesFromSetupAp()) {
+    sendError(403, "setup_ap_connection_required");
+    return;
+  }
+  if (!requestIsSetupAdmin()) return;
+  if (http.arg("confirm_1") != "FACTORY_RESET" ||
+      http.arg("confirm_2") != "FACTORY_RESET" ||
+      http.arg("confirm_3") != "FACTORY_RESET") {
+    http.send(400, "text/html; charset=utf-8",
+              "<!doctype html><meta charset=utf-8><p>Semua tiga konfirmasi harus bertuliskan FACTORY_RESET.</p><a href='/setup'>Kembali</a>");
+    return;
+  }
+  factoryResetPending = true;
+  factoryResetAtMs = millis() + 500U;
+  http.send(202, "text/html; charset=utf-8",
+            "<!doctype html><meta charset=utf-8><p>Factory reset diterima. Server akan restart dan kembali ke mode setup.</p>");
+}
+
 void handleSetupPage() {
-  const String html = R"HTML(<!doctype html><html lang="en"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ServerSmartPlug setup</title><style>body{margin:0;background:#f5f7f8;color:#10202a;font:16px Arial,sans-serif}.wrap{max-width:680px;margin:36px auto;padding:28px;background:#fff;border:1px solid #c7d1d5;border-radius:12px}h1{margin:0 0 10px}p{line-height:1.5}label{display:block;font-weight:bold;margin-top:15px}input{box-sizing:border-box;width:100%;padding:11px;margin-top:6px;border:1px solid #71838b;border-radius:6px;font-size:16px}button{margin-top:22px;padding:12px 16px;border:0;border-radius:6px;background:#075e54;color:#fff;font-weight:bold;font-size:16px}.note{background:#eef5f3;padding:12px;border-left:4px solid #075e54}.small{font-size:13px;color:#253940}</style><main class="wrap"><h1>ServerSmartPlug setup</h1><p>Configure the Wi-Fi connection, the application API token, and the credentials used by SmartPlug MQTT clients. The setup access point remains available after saving.</p><p class="note">The application calls this server REST API. SmartPlug devices use the MQTT broker at port 1883.</p><form method="post" action="/setup"><label>Wi-Fi SSID</label><input name="ssid" maxlength="32" required><label>Wi-Fi password</label><input name="wifi_password" type="password" maxlength="63"><label>Application API token</label><input name="api_token" type="password" minlength="16" maxlength="64" required><label>MQTT username</label><input name="broker_username" minlength="3" maxlength="32" required><label>MQTT password</label><input name="broker_password" type="password" minlength="8" maxlength="63" required><button type="submit">Save configuration</button></form><p class="small">After saving, use the ServerSmartPlug station IP shown by <code>/setup/status</code> as the MQTT broker host in SmartPlug.</p></main></html>)HTML";
+  if (!requestIsSetupAdmin()) return;
+  const String html = R"HTML(<!doctype html><html lang="en"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ServerSmartPlug setup</title><style>body{margin:0;background:#f5f7f8;color:#10202a;font:16px Arial,sans-serif}.wrap{max-width:680px;margin:36px auto;padding:28px;background:#fff;border:1px solid #c7d1d5;border-radius:12px}h1{margin:0 0 10px}p{line-height:1.5}label{display:block;font-weight:bold;margin-top:15px}input{box-sizing:border-box;width:100%;padding:11px;margin-top:6px;border:1px solid #71838b;border-radius:6px;font-size:16px}button{margin-top:22px;padding:12px 16px;border:0;border-radius:6px;background:#075e54;color:#fff;font-weight:bold;font-size:16px}.danger{background:#a3212d}.note{background:#eef5f3;padding:12px;border-left:4px solid #075e54}.warn{margin-top:30px;padding-top:18px;border-top:1px solid #d4b3b7}.small{font-size:13px;color:#253940}</style><main class="wrap"><h1>ServerSmartPlug setup</h1><p>Configure the Wi-Fi connection, the application API token, and the credentials used by SmartPlug MQTT clients. The setup access point remains available after saving.</p><p class="note">The application calls this server REST API. SmartPlug devices use the MQTT broker at port 1883.</p><form method="post" action="/setup"><label>Wi-Fi SSID</label><input name="ssid" maxlength="32" required><label>Wi-Fi password</label><input name="wifi_password" type="password" maxlength="63"><label>Application API token</label><input name="api_token" type="password" minlength="16" maxlength="64" required><label>MQTT username</label><input name="broker_username" minlength="3" maxlength="32" required><label>MQTT password</label><input name="broker_password" type="password" minlength="8" maxlength="63" required><button type="submit">Save configuration</button></form><p class="small">After saving, use the ServerSmartPlug station IP shown by <code>/setup/status</code> as the MQTT broker host in SmartPlug.</p><section class="warn"><h2>Factory reset</h2><p>Only available while connected to the ServerSmartPlug setup Wi-Fi. This removes Wi-Fi, API token, MQTT credentials, and managed SmartPlug records. The SD card is not formatted.</p><form method="post" action="/setup/factory-reset" onsubmit="return confirm('Reset ServerSmartPlug now?')"><label>Type FACTORY_RESET three times</label><input name="confirm_1" autocomplete="off" required><input name="confirm_2" autocomplete="off" required><input name="confirm_3" autocomplete="off" required><button class="danger" type="submit">Factory reset server</button></form></section></main></html>)HTML";
   http.send(200, "text/html; charset=utf-8", html);
 }
 
 void handleSetupSave() {
+  if (!requestIsSetupAdmin()) return;
   const String ssid = http.arg("ssid");
   const String wifiPassword = http.arg("wifi_password");
   const String apiToken = http.arg("api_token");
@@ -3071,6 +3555,37 @@ void handleSetupSave() {
             "<p>Configuration saved. The server is connecting to Wi-Fi. Return to <a href='/setup'>setup</a> and read <code>/setup/status</code> for its station IP.</p>");
 }
 
+// PROPOSED (not yet in design.md as a contract): POST /api/v1/history/reset.
+// Deletes only the measurement history file to free SD space. Device energy totals,
+// snapshots, schedules, timers, the energy-reset audit log and unrelated SD files stay.
+void handleHistoryReset() {
+  if (!requestIsAuthorized()) return;
+  JsonDocument document;
+  if (!http.hasArg("plain") || deserializeJson(document, http.arg("plain")) ||
+      String(document["confirm_1"] | "") != "RESET_HISTORY" ||
+      String(document["confirm_2"] | "") != "RESET_HISTORY" ||
+      String(document["confirm_3"] | "") != "RESET_HISTORY") {
+    sendError(400, "triple_confirmation_required");
+    return;
+  }
+  if (!sdReady) { sendError(503, "storage_unavailable"); return; }
+  uint64_t freedBytes = 0;
+  if (SD.exists(kHistoryPath)) {
+    File file = SD.open(kHistoryPath, FILE_READ);
+    if (file) { freedBytes = file.size(); file.close(); }
+    if (!SD.remove(kHistoryPath)) { sendError(503, "storage_write_failed"); return; }
+  }
+  freedBytes += eraseFineFiles();
+  memset(historyBytesByDevice, 0, sizeof(historyBytesByDevice));
+  historyBytesUnattributed = 0;
+  historyScanOffset = 0;
+  historyScanDone = true;
+  sdCapacityCachedAtMs = 0U;  // freed space must show up immediately, not after the 5-minute cache
+  Serial.println(F("INFO history_reset_complete"));
+  sendJson(200, String("{\"result\":\"history_reset\",\"freed_bytes\":") +
+                String(static_cast<unsigned long>(freedBytes)) + "}");
+}
+
 void handleNotFound() {
   if (http.method() == HTTP_OPTIONS) {
     http.sendHeader("Access-Control-Allow-Origin", "*");
@@ -3092,12 +3607,14 @@ void beginHttpApi() {
   http.on("/", HTTP_GET, handleSetupPage);
   http.on("/setup", HTTP_GET, handleSetupPage);
   http.on("/setup", HTTP_POST, handleSetupSave);
+  http.on("/setup/factory-reset", HTTP_POST, handleSetupFactoryReset);
   http.on("/setup/status", HTTP_GET, handleSetupStatus);
   http.on("/setup/scan-wifi", HTTP_POST, handleSetupScanWifi);
   http.on("/api/v1/factory-reset", HTTP_POST, handleServerFactoryReset);
   http.on("/health", HTTP_GET, handleHealth);
   http.on("/api/v1/status", HTTP_GET, handleStatus);
   http.on("/api/v1/devices", HTTP_GET, handleDevices);
+  http.on("/api/v1/history/reset", HTTP_POST, handleHistoryReset);
   http.onNotFound(handleNotFound);
   http.begin();
 }
@@ -3127,7 +3644,10 @@ void loop() {
   expireStaleDevices();
   expireCommands();
   serviceTimers();
+  serviceBootRestore();
   serviceSchedules();
   serviceStorage();
+  serviceHistoryScan();
+  serviceFineHistory();
   delay(2);
 }

@@ -95,7 +95,8 @@ interface DeviceRepository {
     /** Applies the MQTT profile to the already paired unit, then persists its selected route. */
     suspend fun connectToServer(device: SmartPlugDevice, profile: ServerConnectionProfile): ApiResult<Unit>
     /** Restores direct REST as the app route and clears the device's MQTT profile. */
-    suspend fun disconnectFromServer(device: SmartPlugDevice): ApiResult<Unit>
+    /** [force] = leave Server mode even if the server cannot clean up its timer/schedule for this device. */
+    suspend fun disconnectFromServer(device: SmartPlugDevice, force: Boolean = false): ApiResult<Unit>
     /**
      * True only for the owner credential.  A migrated legacy credential is
      * verified through the firmware's owner-only credential-list endpoint
@@ -134,6 +135,10 @@ interface DeviceControlRepository {
     suspend fun listManagedMembers(device: SmartPlugDevice): ApiResult<List<ManagedMember>>
     suspend fun revokeManagedMember(device: SmartPlugDevice, credentialId: String): ApiResult<Unit>
     suspend fun resetEnergy(device: SmartPlugDevice): ApiResult<Unit>
+    /** PROPOSED: what the relay does when power returns; owner only, served by the local SmartPlug. */
+    suspend fun setPowerPolicy(device: SmartPlugDevice, policy: com.smartplug.app.domain.model.PowerOnPolicy, restoreDelaySeconds: Int): ApiResult<Unit>
+    /** PROPOSED: overcurrent protection on/off; owner only, served by the local SmartPlug. */
+    suspend fun setProtection(device: SmartPlugDevice, enabled: Boolean): ApiResult<Unit>
     suspend fun factoryReset(device: SmartPlugDevice): ApiResult<Unit>
     /**
      * Global reset has to know that the physical SmartPlug accepted its reset
@@ -159,4 +164,16 @@ interface HistoryRepository {
         toUtcMs: Long,
         resolution: HistoryResolution,
     ): ApiResult<List<EnergyHistoryPoint>>
+
+    /** Drops the on-phone cache of fetched history for a device. Never touches the server. */
+    suspend fun clearCachedHistory(deviceId: String)
+}
+
+/** Read-only server storage status for the Storage tab. */
+interface StorageRepository {
+    /** Reads GET /api/v1/status of the server this device is attached to. Never sends commands. */
+    suspend fun fetchSdUsage(device: com.smartplug.app.domain.model.SmartPlugDevice): ApiResult<com.smartplug.app.domain.model.SdUsage>
+
+    /** PROPOSED: asks the server to delete its measurement history (frees SD space). */
+    suspend fun resetServerHistory(device: com.smartplug.app.domain.model.SmartPlugDevice): ApiResult<Unit>
 }

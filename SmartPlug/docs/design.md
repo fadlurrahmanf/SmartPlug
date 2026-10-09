@@ -1,5 +1,33 @@
 # SmartPlug integration design
 
+## Wi-Fi Diagnostics SmartPlug (revisi source R3.10.11, belum di-upload)
+
+Firmware menambahkan `GET /api/v1/diagnostics` dan halaman lokal
+`http://192.168.4.1/diagnostics` tanpa mengubah onboarding, API aplikasi,
+MQTT, timer, Schedule, owner key, atau algoritme kontrol relay. Keduanya
+memerlukan session admin browser atau bearer **owner**; member tidak dapat
+membaca diagnostik. Halaman hanya menampilkan data dan daftar event, tanpa
+kontrol relay. Target refresh awal-ke-awal 1 detik; bila request lebih lama,
+request berikutnya baru dimulai setelah respons selesai, tanpa overlap.
+
+JSON diagnostik memuat versi firmware, device ID, uptime, `ESP.getResetReason()`,
+free heap/max free block, AP dan STA, Direct/MQTT dan koneksi broker, relay dan
+hasil command terakhir, interval half/full cycle zero crossing dalam us,
+estimasi Hz, interval saat pulse sukses terakhir, serta status ZX
+`valid`/`waiting`/`timeout`/`unavailable`. Kesehatan BL0940 menampilkan
+reader state, usia sampel, jumlah paket baik/buruk. Status LittleFS, energi
+tersimpan, dan checkpoint diagnostik juga tersedia.
+
+Ring 24 event mencatat boot/reset reason, queue/wait/start/complete/fallback
+relay, transisi Wi-Fi/MQTT, serta timer/Schedule. Tiap event disimpan di RTC
+user memory tanpa write flash. Snapshot CRC di-checkpoint ke dua slot
+LittleFS minimal berjarak 30 detik dan dipulihkan saat boot; putus daya total
+dapat menghilangkan event sesudah checkpoint terakhir. Factory reset
+menghapus ring. Pengamatan ini alat bantu bukti, bukan kesimpulan penyebab
+restart dari source. Tidak boleh memakai USB-to-TTL biasa ketika P1 diberi
+220 VAC; uji AC/relay harus dilakukan terpisah dengan fixture aman. Revisi
+ini hanya dibuild, tidak di-upload dalam pekerjaan ini.
+
 > **Status dokumen — 6 Oktober 2026.** Dokumen ini menjelaskan perilaku
 > yang sudah ada pada source build `smartplug_product`, `server_esp32`, dan Android
 > debug saat ini, kecuali bagian yang secara eksplisit diberi label *batasan*
@@ -561,16 +589,36 @@ Respons `202` wajib memuat `api_version`, `command_id`, `state`, dan
 
 ### Status relay
 
-Firmware menyimpan `relay_state` sebagai status logis terakhir. Pada boot,
-arus di atas ambang `0.02 A` menetapkan `relay_state: "on"`. Bila arus tidak
-melewati ambang, firmware mengirim satu pulsa relay OFF lalu menetapkan
-`relay_state: "off"`.
+Firmware menyimpan `relay_state` sebagai status logis terakhir. Perintah ON atau
+OFF mengubah keluaran hanya bila state tujuan berbeda dari `relay_state`. Jeda
+minimum antarpergantian adalah satu detik pada relay latching. Setelah
+perubahan selesai, firmware memperbarui `relay_state`, lalu menerbitkan state
+tersebut pada REST dan MQTT. Aplikasi menganggap command selesai hanya setelah
+state baru itu diterima.
 
-Perintah ON atau OFF mengirim pulsa hanya bila state tujuan berbeda dari
-`relay_state`. Jeda minimum antarpulsa adalah satu detik. Setelah pulsa selesai,
-firmware memperbarui `relay_state`, lalu menerbitkan state tersebut pada REST
-dan MQTT. Aplikasi menganggap command selesai hanya setelah state baru itu
-diterima.
+#### Pemulihan state saat listrik kembali (implementasi R3.10.x, belum terverifikasi pada hardware)
+
+Aturan lama "arus di atas `0.02 A` menetapkan state saat boot" dan "selalu ON saat
+boot" **tidak berlaku lagi**. Firmware tidak tahu berapa lama listrik mati
+(tidak ada RTC baterai) dan tidak membuat aturan berbasis durasi mati.
+
+- **Mode Direct.** Setiap state relay yang sudah stabil 1,5 detik disimpan ke
+  LittleFS pada dua slot bergantian (`/relay-a.dat`, `/relay-b.dat`) dengan CRC32,
+  memakai pola yang sama dengan persistensi energi; tulisan yang terputus saat
+  listrik mati hanya merusak slot yang sedang ditulis. Saat boot firmware
+  membaca state terakhir dan, bila ON, menyalakan relay **sekali** setelah jeda
+  3 detik. Record hilang atau korup berarti OFF (fail-safe). Pada build SSR,
+  keluaran sudah OFF setelah boot sehingga state OFF tidak memicu apa pun; pada
+  relay latching, state OFF yang tersimpan menghasilkan satu pulsa OFF. Perubahan
+  state sebelum keputusan restore tidak boleh menimpa record, dan penulisan yang
+  gagal dicoba ulang paling cepat tiap 30 detik. Pemulihan hanya berjalan pada
+  build yang mengizinkan aktuasi relay (`SMARTPLUG_ALLOW_RELAY_ACTUATION`).
+  Logika keputusan ada di `firmware/include/SmartPlugPowerRestore.h` dan diuji di
+  host.
+- **Mode Server.** SmartPlug tidak memulihkan sendiri dan tidak memakai
+  `relay_state` snapshot server untuk menjalankan relay. Rekonsiliasi dilakukan
+  server (lihat "Rekonsiliasi relay setelah SmartPlug boot ulang").
+- Tidak ada pengaturan kebijakan off/last/on di aplikasi pada versi ini.
 
 ### Kompatibilitas versi
 
@@ -701,11 +749,84 @@ tombol clear. Riwayat pengukuran menampilkan grafik dan statistik Now/Min/Avg/
 Peak. Aplikasi menandai perangkat offline segera setelah polling gagal, tidak
 mempertahankan status online terakhir.
 
-Navigasi bawah berisi **Home**, **Devices**, dan **Settings**. Penambahan
+Navigasi bawah berisi **Home**, **Devices**, dan **Settings**; tab **Storage** muncul di antara
+Devices dan Settings hanya bila ada minimal satu SmartPlug tersimpan dengan mode koneksi SERVER (lihat
+"Tab Storage aplikasi"). Penambahan
 SmartPlug dilakukan melalui ikon `+` pada halaman Devices. Pergantian bahasa
 tersedia melalui Settings. Label pada fitur baru menyediakan bahasa Indonesia
 dan English; penyelarasan seluruh teks lama pada dialog/onboarding masih
 merupakan pekerjaan UI tersisa.
+
+### Tab Storage aplikasi
+
+Catatan perilaku aplikasi:
+
+- **Visibilitas.** Tab Storage muncul bila ada minimal satu SmartPlug tersimpan dengan
+  `integrationMode == SERVER` **dan** server itu masih terdaftar di aplikasi (Unpair Server
+  menghapus token server dari HP sehingga tab hilang). Aturannya berdasar koneksi tersimpan, bukan
+  keterjangkauan server, sehingga tab tidak hilang saat server sebentar mati; saat tidak terjangkau,
+  tab menampilkan "server tidak terjangkau" dan data terakhir yang berhasil dimuat. Bila tab hilang
+  saat pengguna berada di Storage, aplikasi otomatis kembali ke Home.
+- **Data.** `GET` ke `/devices/<id>/history` dan `GET /api/v1/status?storage=1`. Resolusi dipilih
+  otomatis: rentang <= 2 hari memakai 5m, <= 60 hari memakai 1h, selebihnya 1d; bila `from` lebih tua
+  dari retensi resolusi terpilih (1m 90 hari, 5m 1 tahun, 1h 5 tahun) aplikasi naik ke resolusi
+  yang lebih kasar dan menampilkan keterangan. Data per detik hanya dipakai layar Riwayat
+  (pilihan 5 dan 15 menit). Data mentah per 500 ms tidak dimuat. Data dimuat saat tab dibuka, saat
+  periode berubah, atau saat tombol muat ulang ditekan; bukan realtime.
+- **Analisis.** Total kWh dari selisih positif counter energi kumulatif (penurunan counter dianggap
+  reset dan dilewati), daya rata-rata dan puncak, kWh per hari, kontribusi per perangkat,
+  perbandingan bulan ini vs bulan lalu. Hari tanpa satu pun record ditandai "bolong"; server hanya
+  menulis riwayat saat waktu tersinkron dan SD siap, sehingga total bisa lebih kecil dari pemakaian
+  sebenarnya. Biaya dan penyesuaian kWh per perangkat memakai helper yang sama (hanya tampilan).
+  "Records loaded" adalah jumlah titik riwayat yang dimuat untuk periode, bukan jumlah data di SD.
+- **Kapasitas SD (usulan).** Kartu menampilkan pemakaian data SmartPlug saja (jumlah
+  `history_by_device`) dibanding `sd_total_bytes`, dengan satuan yang menyesuaikan (B, KB, MB,
+  GB); nol tampil "0". Bila server belum melaporkan tampil "– / –". Setiap kartu perangkat
+  menampilkan memorinya di SD dan persennya dari total. Banner "SD hampir penuh" (> 85%) dan
+  estimasi penuh memakai pemakaian kartu sebenarnya (`sd_used_bytes`); estimasi memakai sampel
+  (waktu, terpakai) lokal dan butuh minimal dua titik berjarak >= 1 hari.
+- **Export CSV.** Membangun file UTF-8 di cache aplikasi lalu membuka menu bagikan Android
+  (FileProvider, `ACTION_SEND`, `text/csv`). Tanpa email, SMTP, backend, atau kredensial. File
+  cache yang lebih tua dari 1 hari dihapus pada tiap export baru; periode tanpa data tidak membuka
+  menu bagikan.
+- **Reset storage (usulan).** Tiga konfirmasi dan ketik "Reset storage" memanggil
+  `POST /api/v1/history/reset` (lihat tabel request), lalu menghapus cache riwayat dan sampel
+  estimasi SD di HP. Bila server gagal/menolak atau firmware belum mendukung (404), tidak ada yang
+  dihapus dan aplikasi menampilkan alasannya.
+
+### Pengaturan dan koneksi aplikasi
+
+- **Format kWh.** Pengaturan memilih 0 sampai 5 angka di belakang koma (slider dengan pratinjau,
+  default 3) untuk semua nilai kWh di Beranda, daftar perangkat, detail, riwayat, tren live, dan Storage.
+  Label kWh/menit dan sumbu grafik tidak ikut.
+- **Memutus dari server.** Putuskan mengembalikan SmartPlug ke Direct. Bila server tidak lagi
+  terdaftar di HP (Unpair Server), pembersihan server dilewati dan Putuskan langsung berhasil. Bila server
+  terdaftar tetapi tidak terjangkau atau menolak, aplikasi menawarkan **Putuskan paksa** setelah
+  konfirmasi; timer/Schedule yang masih tersimpan di server untuk SmartPlug itu tidak dibersihkan.
+- **Ringkasan harian.** Kartu "Ringkasan hari ini" di Beranda (saklar tampil/sembunyi di Pengaturan,
+  default aktif) menampilkan pemakaian hari ini (dengan Rp bila biaya aktif), perangkat paling banyak
+  memakai, daya tertinggi beserta jamnya, daya saat standby (hanya bila daya terendah <= 10 W), dan
+  perbandingan dengan kemarin pada jam yang sama. Data dari riwayat resolusi kasar yang sudah ada,
+  dimuat paling sering sekali per menit; data kosong atau bolong tidak membuat kartu error.
+- **Peringatan beban.** Bila arus terukur melebihi 2 A (rating relay SSR yang dipakai), detail SmartPlug
+  menampilkan banner "Beban terlalu besar". Peringatan saja; aplikasi tidak mengirim perintah apa pun.
+- **Pengaturan perangkat dari firmware (usulan).** "Proteksi beban" dan "Saat listrik kembali" (Tetap mati,
+  Seperti sebelum mati, Selalu menyala, dengan tunda menyala 0 sampai 600 detik) hanya muncul untuk pemilik
+  SmartPlug dan hanya bila firmware melaporkan pengaturan itu; firmware lama tidak menampilkannya. Memilih
+  selain "Tetap mati" meminta konfirmasi dengan peringatan keselamatan. Bila firmware melaporkan relay dimatikan
+  oleh proteksi, aplikasi menampilkan banner dengan tombol "Nyalakan lagi" (konfirmasi dahulu). Teks di
+  aplikasi sengaja sederhana; istilah teknis tidak ditampilkan.
+- **Diagnostik tersembunyi.** Mengetuk judul "Tentang" di Pengaturan lima kali dalam tiga detik membuka kotak
+  password. Password hanya disimpan sebagai hash berasalan (PBKDF2-SHA256), bukan teks; lima kesalahan
+  berturut-turut mengunci input 30 detik. Ini penghalang ringan, bukan keamanan kuat. Layar Diagnostik
+  (hanya baca) menampilkan hasil tes koneksi (latensi atau alasan gagal dalam bahasa sederhana), mode dan
+  alamat, sinyal Wi-Fi HP, usia data terakhir, versi firmware, uptime, alasan restart, jumlah boot,
+  status proteksi, dan kebijakan listrik kembali; nilai yang tidak dilaporkan firmware tampil "–".
+  "Salin laporan" menyalin ringkasan teks tanpa token atau password.
+- **Tambahkan HP.** SmartPlug menolak kode undangan baru (`409 invite_already_active`) selama kode
+  sebelumnya berlaku (maksimal 5 menit) dan tidak pernah menampilkannya lagi. Aplikasi menyimpan
+  kode terakhir yang ia buat di penyimpanan terenkripsi sampai kedaluwarsa dan menampilkannya lagi
+  bila dialog atau aplikasi ditutup.
 
 ## Mode dengan server (MQTT)
 
@@ -945,7 +1066,8 @@ mengirim `sync/request` secara aktif. Server membalas `sync/snapshot` dengan
 snapshot recovery lengkap terakhir; SmartPlug memakai **nilai energi** dari respons itu
 untuk continuity counter dan tidak memakai `relay_state` snapshot untuk
 menjalankan relay. Pembacaan BL0940 lokal tetap menjadi sumber data live
-setelah boot.
+setelah boot. Pengembalian state relay setelah boot dilakukan server dengan perintah
+bertanda tangan biasa (lihat "Rekonsiliasi relay setelah SmartPlug boot ulang").
 
 Jika reboot SmartPlug sangat cepat sehingga server masih menganggap boot lama
 aktif, SmartPlug mengulang `sync/request` bertanda tangan setiap sekitar satu
@@ -983,7 +1105,9 @@ X-API-Key: <api_token>
 | Ringkasan satu SmartPlug | `GET /api/v1/devices/<device_id>` |
 | Nilai pengukuran terbaru | `GET /api/v1/devices/<device_id>/latest` |
 | Total energi server | `GET /api/v1/devices/<device_id>/energy` |
-| Riwayat | `GET /api/v1/devices/<device_id>/history?from=<utc>&to=<utc>&resolution=<1m|5m|30m|1h|1d>` |
+| Riwayat | `GET /api/v1/devices/<device_id>/history?from=<utc>&to=<utc>&resolution=<1s|1m|5m|30m|1h|1d>`; `1s` adalah **usulan** (lihat "Riwayat per detik"), maksimal satu jam per permintaan. |
+| Kapasitas SD dan pemakaian per SmartPlug | **Usulan:** `GET /api/v1/status?storage=1` menambahkan di objek `storage`: `sd_total_bytes`, `sd_used_bytes`, `history_scan_complete`, `history_bytes_total`, dan `history_by_device[{device_id, bytes}]`. Tanpa `?storage=1` field itu tidak dihitung. |
+| Hapus riwayat | **Usulan:** `POST /api/v1/history/reset` dengan `confirm_1..3 = "RESET_HISTORY"`; menghapus berkas riwayat per menit dan semua berkas per detik, tidak menyentuh total energi, snapshot, timer, Schedule, audit reset energi, atau berkas lain di SD. Respons `200 {"result":"history_reset","freed_bytes":N}`; `400 triple_confirmation_required`, `503 storage_unavailable`/`storage_write_failed`. |
 | Kirim relay | `POST /api/v1/devices/<device_id>/relay` dengan JSON `{ "state": "on" }` atau `{ "state": "off" }` |
 | Reset energi | `POST /api/v1/devices/<device_id>/energy/reset` dengan tiga field konfirmasi `RESET_ENERGY`; riwayat sebelum reset tetap tersimpan sebagai audit. |
 | Factory reset | `POST /api/v1/devices/<device_id>/factory-reset` dengan tiga field `FACTORY_RESET`; server menerbitkan perintah MQTT dan perangkat reboot ke mode pemasangan. |
@@ -1061,6 +1185,7 @@ batas aktif tercapai.
 
 | Resolusi | Retensi target |
 |---|---:|
+| 1 detik (usulan) | 30 hari |
 | 1 menit | 90 hari |
 | 5 menit | 1 tahun |
 | 1 jam | 5 tahun |
@@ -1071,6 +1196,48 @@ siap, penuh, atau terjadi kegagalan tulis, data `/latest` tetap tersedia;
 endpoint riwayat mengembalikan `503 history_unavailable` dan aplikasi
 menampilkan status riwayat tidak tersedia. Server melakukan rotasi dan
 kompaksi record sesuai retensi di atas sebelum kapasitas SD habis.
+
+### Riwayat per detik (usulan, diimplementasikan di server R3.8.21)
+
+Selain riwayat per menit (`/smartplug/history.csv`, satu baris rata-rata per menit per
+SmartPlug), server menyimpan baris per detik di
+`/smartplug/s/<device_id>/<yyyymmdd>.csv` (hari UTC; kolom `utc,V,A,W,VA,PF,Wh`).
+
+- **Penulisan berkelompok.** Baris ditampung di RAM dan ditulis tiap 10 detik, sehingga tiap berkas
+  dibuka satu kali per kelompok berapa pun jumlah barisnya. Antrean maksimal 160 baris; baris
+  yang tidak muat dihitung sebagai dibuang. Listrik server mati dapat menghilangkan hingga sekitar
+  10 detik data.
+- **Interval otomatis.** Langkah sampling adalah 1, 2, 5, atau 10 detik. Bila satu penulisan
+  memakan lebih dari 150 ms, langkah naik satu tingkat; setelah 30 penulisan cepat berturut-turut
+  (< 40 ms) langkah turun satu tingkat. Dengan begitu server tetap responsif saat jumlah
+  SmartPlug bertambah atau kartu SD lambat. Tidak ada batas jumlah SmartPlug tetap karena
+  kecepatan kartu belum terukur; serial server mencatat `fine_history_step_s=`.
+- **Retensi.** Berkas lebih tua dari 30 hari dihapus sekali per hari (UTC).
+- **Pembacaan.** `resolution=1s` membaca berkas harian yang bersinggungan dengan rentang dan
+  menyertakan baris yang masih menunggu di antrean RAM. Rentang lebih dari 3600 detik ditolak
+  dengan `400 range_too_large_for_resolution`. Rentang panjang tetap memakai riwayat per menit.
+- **Pemakaian per SmartPlug.** Server menghitung ukuran baris per SmartPlug pada berkas per menit
+  lewat pemindaian bertahap di latar belakang setelah boot (`history_scan_complete=false`
+  sampai selesai) dan menjumlahkannya dengan ukuran berkas per detik; angkanya direset saat riwayat
+  dihapus.
+- **Kapasitas.** `sd_used_bytes` dihitung dari FAT dan di-cache lima menit (dibatalkan saat riwayat
+  dihapus) karena dapat memblokir server beberapa detik pada kartu besar.
+
+### Rekonsiliasi relay setelah SmartPlug boot ulang (usulan, diimplementasikan di server R3.8.21)
+
+Server tetap authority timer dan Schedule. SmartPlug tidak menjalankan relay dari snapshot server;
+setelah boot ulang yang disaksikan server (epoch boot baru muncul setelah epoch sebelumnya pernah
+terlihat pada run server yang sama), server dapat mengembalikan relay ke state terakhir yang ia
+ketahui dengan **perintah relay bertanda tangan biasa** (`command_id` berawalan `restore-`):
+
+1. Server mencatat state relay terakhir sebelum boot baru diterima, lalu menunggu SmartPlug
+   melaporkan state setelah boot (minimal 4 detik, batal setelah 60 detik).
+2. Perintah dikirim hanya bila state yang dilaporkan berbeda dari target (`unknown` dianggap OFF).
+   Timer yang sudah kedaluwarsa membuat targetnya OFF.
+3. Sekali per boot. Perintah pengguna, timer, atau Schedule yang lebih baru membatalkannya, dan
+   restart server sendiri tidak pernah memutar ulang state lama dari SD.
+4. Hasilnya dicatat di log serial (`reconcile_after_boot...`); belum ada audit yang terlihat di
+   aplikasi.
 
 ### Kondisi keberhasilan mode dengan server
 

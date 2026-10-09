@@ -192,6 +192,33 @@ data class DeviceStatus(
     /** Direct-mode LittleFS checkpoint status; null means this source does not expose it. */
     val energySavedWh: Double? = null,
     val energyNextSaveMs: Long? = null,
+    // PROPOSED device fields; null = this firmware does not report it.
+    val firmwareVersion: String? = null,
+    val uptimeSeconds: Long? = null,
+    val resetReason: String? = null,
+    val bootCount: Long? = null,
+    val powerOnPolicy: PowerOnPolicy? = null,
+    val restoreDelaySeconds: Int? = null,
+    val protection: ProtectionStatus? = null,
+    val overcurrentWarning: Boolean? = null,
+)
+
+/** What a SmartPlug does with its relay when power returns. */
+enum class PowerOnPolicy(val wire: String) {
+    OFF("off"),
+    LAST("last"),
+    ON("on");
+
+    companion object {
+        fun fromWire(value: String?): PowerOnPolicy? = entries.firstOrNull { it.wire == value }
+    }
+}
+
+data class ProtectionStatus(
+    val enabled: Boolean,
+    val tripped: Boolean,
+    val warnA: Double? = null,
+    val tripA: Double? = null,
 )
 
 data class DailyScheduleEntry(
@@ -230,6 +257,8 @@ data class EnergyHistoryPoint(
 )
 
 enum class HistoryResolution(val wireValue: String) {
+    /** PROPOSED: per-second rows, kept 30 days and served for ranges up to one hour. */
+    ONE_SECOND("1s"),
     ONE_MINUTE("1m"),
     FIVE_MINUTES("5m"),
     THIRTY_MINUTES("30m"),
@@ -242,4 +271,14 @@ data class ApiFailure(
     val httpCode: Int,
     val errorCode: String,
     val message: String? = null,
+)
+
+/** SD card usage reported by a ServerSmartPlug; both fields null when the server does not report them yet. */
+data class SdUsage(
+    val usedBytes: Long?,
+    val totalBytes: Long?,
+    /** deviceId -> bytes of SD history that SmartPlug occupies (empty when the server does not report it). */
+    val deviceBytes: Map<String, Long> = emptyMap(),
+    /** False while the server is still tallying; per-device numbers are then partial. */
+    val deviceBytesComplete: Boolean = true,
 )

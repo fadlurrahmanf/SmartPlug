@@ -6,6 +6,8 @@ import com.smartplug.app.data.repository.DiscoveryRepositoryImpl
 import com.smartplug.app.data.repository.HistoryRepositoryImpl
 import com.smartplug.app.data.repository.PairingRepositoryImpl
 import com.smartplug.app.data.repository.RelayRepositoryImpl
+import com.smartplug.app.data.repository.StorageRepositoryImpl
+import com.smartplug.app.domain.repository.StorageRepository
 import com.smartplug.app.data.repository.WifiOnboardingRepositoryImpl
 import com.smartplug.app.domain.repository.DeviceRepository
 import com.smartplug.app.domain.repository.DeviceControlRepository
@@ -51,4 +53,8 @@ abstract class RepositoryModule {
     @Binds
     @Singleton
     abstract fun bindHistoryRepository(impl: HistoryRepositoryImpl): HistoryRepository
+
+    @Binds
+    @Singleton
+    abstract fun bindStorageRepository(impl: StorageRepositoryImpl): StorageRepository
 }

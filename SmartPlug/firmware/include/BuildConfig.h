@@ -20,6 +20,13 @@
 #define SMARTPLUG_RELAY_COOLDOWN_MS 500
 #endif
 
+// 0 = original dual-coil latching relay. 1 = external AC SSR driven through
+// Q3/SET1: GPIO5 HIGH keeps the SSR input asserted; GPIO5 LOW releases it.
+// Keep the production default on the verified latching-relay behavior.
+#ifndef SMARTPLUG_RELAY_MODE_SSR
+#define SMARTPLUG_RELAY_MODE_SSR 0
+#endif
+
 #ifndef SMARTPLUG_ENABLE_LOCAL_API
 #define SMARTPLUG_ENABLE_LOCAL_API 0
 #endif
@@ -41,7 +48,7 @@
 
 // This is the single release identifier shown by the dashboard, API, serial
 // startup report, and upload report.  Bump it for every firmware release.
-#define SMARTPLUG_RELEASE_VERSION "R3.10.2"
+#define SMARTPLUG_RELEASE_VERSION "R3.10.11"
 
 #ifndef SMARTPLUG_STANDBY_THRESHOLD_W
 #define SMARTPLUG_STANDBY_THRESHOLD_W 2.0F
@@ -83,10 +90,13 @@ constexpr bool kButtonEnabled = SMARTPLUG_ENABLE_BUTTON == 1;
 constexpr bool kLedEnabled = SMARTPLUG_ENABLE_LED == 1;
 constexpr unsigned long kRelayPulseMs = SMARTPLUG_RELAY_PULSE_MS;
 constexpr unsigned long kRelayCooldownMs = SMARTPLUG_RELAY_COOLDOWN_MS;
+constexpr bool kRelayModeSsr = SMARTPLUG_RELAY_MODE_SSR == 1;
 constexpr bool kLocalApiEnabled = SMARTPLUG_ENABLE_LOCAL_API == 1;
 constexpr bool kMqttEnabled = SMARTPLUG_ENABLE_MQTT == 1;
 #if SMARTPLUG_LEGACY_FS_MIGRATION_STAGE
 constexpr char kFirmwareVersion[] = SMARTPLUG_RELEASE_VERSION "-migrate64";
+#elif SMARTPLUG_RELAY_MODE_SSR
+constexpr char kFirmwareVersion[] = SMARTPLUG_RELEASE_VERSION "-ssr";
 #elif SMARTPLUG_LITTLEFS_32K
 constexpr char kFirmwareVersion[] = SMARTPLUG_RELEASE_VERSION "-32k";
 #elif defined(SMARTPLUG_FACTORY_PROVISIONED)

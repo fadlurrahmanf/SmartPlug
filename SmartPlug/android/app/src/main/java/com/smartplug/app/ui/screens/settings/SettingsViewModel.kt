@@ -5,6 +5,7 @@ import androidx.lifecycle.viewModelScope
 import com.smartplug.app.data.local.AppPreferences
 import com.smartplug.app.data.local.AppSettings
 import com.smartplug.app.data.local.AppThemeMode
+import com.smartplug.app.data.local.TapSoundStyle
 import com.smartplug.app.data.local.SecureTokenStore
 import com.smartplug.app.data.local.ServerProfileStore
 import com.smartplug.app.data.local.db.HistoryDao
@@ -44,6 +45,7 @@ class SettingsViewModel @Inject constructor(
     private val secureTokenStore: SecureTokenStore,
     private val serverProfileStore: ServerProfileStore,
     private val apiClientFactory: ApiClientFactory,
+    private val soundManager: com.smartplug.app.util.SoundManager,
 ) : ViewModel() {
 
     val settings: StateFlow<AppSettings> = appPreferences.settings.stateIn(
@@ -58,6 +60,21 @@ class SettingsViewModel @Inject constructor(
     val appResetState: StateFlow<AppResetUiState> = _appResetState
 
     fun setSoundEnabled(enabled: Boolean) = viewModelScope.launch { appPreferences.setSoundEnabled(enabled) }
+    fun setKwhAdjustPercent(deviceId: String, percent: Double) =
+        viewModelScope.launch { appPreferences.setKwhAdjustPercent(deviceId, percent) }
+
+    /** Raw kWh straight from the device (read-only GET), for the adjustment preview. */
+    suspend fun rawKwh(device: SmartPlugDevice): Double? =
+        (deviceRepository.fetchMeasurement(device) as? ApiResult.Success)?.value?.energyWh?.div(1000.0)
+
+    fun setDailySummaryEnabled(enabled: Boolean) = viewModelScope.launch { appPreferences.setDailySummaryEnabled(enabled) }
+    fun setKwhDecimals(decimals: Int) = viewModelScope.launch { appPreferences.setKwhDecimals(decimals) }
+    fun setCostEnabled(enabled: Boolean) = viewModelScope.launch { appPreferences.setCostEnabled(enabled) }
+    fun setTariffPerKwh(tariff: Double) = viewModelScope.launch { appPreferences.setTariffPerKwh(tariff) }
+    fun setSoundStyle(style: TapSoundStyle) = viewModelScope.launch {
+        appPreferences.setSoundStyle(style)
+        soundManager.preview(style)
+    }
     fun setHapticEnabled(enabled: Boolean) = viewModelScope.launch { appPreferences.setHapticEnabled(enabled) }
     fun setThemeMode(mode: AppThemeMode) = viewModelScope.launch { appPreferences.setThemeMode(mode) }
     fun setLanguage(language: AppLanguage) = viewModelScope.launch { appPreferences.setLanguage(language) }
@@ -119,6 +136,7 @@ class SettingsViewModel @Inject constructor(
         }
         if (failedNames.isEmpty()) {
             secureTokenStore.clearAll()
+            serverProfileStore.refresh()
             appPreferences.reset()
             _appResetState.value = AppResetUiState(
                 summary = if (devices.isEmpty() && servers.isEmpty()) "Data aplikasi direset." else "$resetCount target SmartPlug/server di-factory-reset dan data aplikasi dihapus.",

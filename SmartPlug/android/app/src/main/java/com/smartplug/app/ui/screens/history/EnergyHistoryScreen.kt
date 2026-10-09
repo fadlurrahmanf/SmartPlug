@@ -64,7 +64,7 @@ fun EnergyHistoryScreen(
             ) {
                 HistoryRange.entries.forEach { range ->
                     FilterChip(
-                        selected = uiState.resolution == range.resolution,
+                        selected = uiState.range == range,
                         onClick = { viewModel.loadRange(range) },
                         label = { Text(range.label(language)) },
                     )
@@ -83,7 +83,12 @@ fun EnergyHistoryScreen(
                         description = localized(language, "Mode langsung menyimpan satu titik tiap menit saat halaman perangkat terbuka. Mode server memuat riwayat dari SD card ServerSmartPlug.", "Direct mode saves one point per minute while the device page is open. Server mode loads history from the ServerSmartPlug SD card."),
                     )
                     else -> {
-                        HistorySummary(points = uiState.points, languageEnglish = language.name == "ENGLISH")
+                        // Display-only correction: the stored/fetched points stay raw.
+                        val adjustPercent = com.smartplug.app.util.LocalEnergyAdjustments.current[deviceId] ?: 0.0
+                        val shownPoints = remember(uiState.points, adjustPercent) {
+                            uiState.points.map { it.copy(energyWh = com.smartplug.app.util.applyEnergyAdjustment(it.energyWh, adjustPercent)) }
+                        }
+                        HistorySummary(points = shownPoints, languageEnglish = language.name == "ENGLISH")
                         // One chart at a time, chosen with chips: energy first, then power and the rest.
                         val metrics = listOf<HistoryMetric>(
                             HistoryMetric(localized(language, "Energi", "Energy"), localized(language, "Energi kumulatif (kWh)", "Cumulative energy (kWh)"), "kWh") { it.energyWh.coerceAtLeast(0.0) / 1000.0 },
@@ -103,7 +108,7 @@ fun EnergyHistoryScreen(
                             }
                         }
                         val chosen = metrics[selectedMetric.coerceIn(0, metrics.lastIndex)]
-                        HistoryMetricCard(chosen.title, uiState.points, chosen.unit, chosen.value)
+                        HistoryMetricCard(chosen.title, shownPoints, chosen.unit, chosen.value)
                     }
                 }
             }
@@ -136,7 +141,7 @@ private fun HistorySummary(points: List<EnergyHistoryPoint>, languageEnglish: Bo
         Row(verticalAlignment = androidx.compose.ui.Alignment.Bottom, modifier = Modifier.padding(top = 4.dp)) {
             com.smartplug.app.ui.components.AnimatedDecimal(
                 value = energyUsedKwh,
-                decimals = 3,
+                decimals = com.smartplug.app.util.LocalKwhDecimals.current,
                 style = MaterialTheme.typography.displaySmall,
                 fontWeight = androidx.compose.ui.text.font.FontWeight.Bold,
             )
@@ -216,6 +221,8 @@ private class HistoryMetric(
 private fun formatHistory(value: Double): String = String.format(Locale.US, "%.2f", value)
 
 private fun HistoryRange.label(language: com.smartplug.app.ui.localization.AppLanguage): String = when (this) {
+    HistoryRange.LAST_5_MIN -> localized(language, "5 menit", "5 min")
+    HistoryRange.LAST_15_MIN -> localized(language, "15 menit", "15 min")
     HistoryRange.LAST_HOUR -> localized(language, "1 jam", "1 hour")
     HistoryRange.LAST_DAY -> localized(language, "24 jam", "24 hours")
     HistoryRange.LAST_WEEK -> localized(language, "7 hari", "7 days")

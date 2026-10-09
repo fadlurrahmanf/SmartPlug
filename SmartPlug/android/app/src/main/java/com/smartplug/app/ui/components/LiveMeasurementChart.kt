@@ -1,10 +1,21 @@
 package com.smartplug.app.ui.components
 
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.ArrowDropDown
+import androidx.compose.material.icons.filled.Remove
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.AssistChip
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.Icon
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -35,21 +46,47 @@ enum class LiveMetric(val label: String, val unit: String, val color: Color) {
     POWER_FACTOR("PF", "%", Color(0xFF8B5CF6)),
 }
 
-/** Fixed four-minute window, matching the X axis labels below. */
-private const val WINDOW_MINUTES = 4
+/** Selectable X-axis spans (milliseconds). Must not exceed the ViewModel's live-point retention. */
+private val WINDOW_OPTIONS = listOf(
+    60_000L to "1 mnt",
+    5 * 60_000L to "5 mnt",
+    10 * 60_000L to "10 mnt",
+    15 * 60_000L to "15 mnt",
+    30 * 60_000L to "30 mnt",
+    45 * 60_000L to "45 mnt",
+    60 * 60_000L to "1 jam",
+    120 * 60_000L to "2 jam",
+)
+
+/** Positive "time ago" label (no minus sign), e.g. 45s, 5m, 1h30m. */
+private fun formatSpan(ms: Long): String {
+    val totalSeconds = ms / 1000
+    val h = totalSeconds / 3600
+    val m = (totalSeconds % 3600) / 60
+    val s = totalSeconds % 60
+    return when {
+        h > 0 -> if (m == 0L && s == 0L) "${h}h" else if (s == 0L) "${h}h${m}m" else "${h}h${m}m${s}s"
+        m > 0 -> if (s == 0L) "${m}m" else "${m}m${s}s"
+        else -> "${s}s"
+    }
+}
 
 @Composable
 fun LiveMeasurementChart(
     points: List<LiveMeasurementPoint>,
-    @Suppress("UNUSED_PARAMETER") onClear: () -> Unit,
+    onClear: () -> Unit,
     modifier: Modifier = Modifier,
+    energyAdjustPercent: Double = 0.0,
 ) {
     val language = LocalAppLanguage.current
+    val tapFeedback = rememberTapFeedback()
     var metric by remember { mutableStateOf(LiveMetric.ENERGY) }
     var minimized by remember { mutableStateOf(false) }
-    val cutoff = System.currentTimeMillis() - WINDOW_MINUTES * 60_000L
+    var windowMs by remember { mutableStateOf(5 * 60_000L) }
+    var windowMenuOpen by remember { mutableStateOf(false) }
+    val cutoff = System.currentTimeMillis() - windowMs
     val visible = points.filter { it.timestampMs >= cutoff }
-    val values = visible.map { metricValue(it, metric) }
+    val values = visible.map { metricValue(it, metric, energyAdjustPercent) }
 
     SmartPlugCard(modifier = modifier) {
         Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -58,10 +95,34 @@ fun LiveMeasurementChart(
                 style = MaterialTheme.typography.titleMedium,
                 modifier = Modifier.weight(1f),
             )
-            AssistChip(
-                onClick = { minimized = !minimized },
-                label = { Text(if (minimized) localized(language, "Tampilkan", "Show") else localized(language, "Minimalkan", "Minimize")) },
-            )
+            if (!minimized) {
+                AssistChip(
+                    onClick = onClear,
+                    label = { Text(localized(language, "Clear", "Clear")) },
+                )
+                Spacer(Modifier.width(6.dp))
+                Box {
+                    AssistChip(
+                        onClick = { windowMenuOpen = true },
+                        label = { Text(WINDOW_OPTIONS.first { it.first == windowMs }.second) },
+                        trailingIcon = { Icon(Icons.Filled.ArrowDropDown, contentDescription = null) },
+                    )
+                    DropdownMenu(expanded = windowMenuOpen, onDismissRequest = { windowMenuOpen = false }) {
+                        WINDOW_OPTIONS.forEach { (ms, label) ->
+                            DropdownMenuItem(
+                                text = { Text(label) },
+                                onClick = { tapFeedback.onTap(); windowMs = ms; windowMenuOpen = false },
+                            )
+                        }
+                    }
+                }
+            }
+            IconButton(onClick = { minimized = !minimized }) {
+                Icon(
+                    if (minimized) Icons.Filled.Add else Icons.Filled.Remove,
+                    contentDescription = if (minimized) localized(language, "Tampilkan grafik", "Show chart") else localized(language, "Minimalkan grafik", "Minimize chart"),
+                )
+            }
         }
         if (minimized) return@SmartPlugCard
         Row(
@@ -84,7 +145,7 @@ fun LiveMeasurementChart(
             verticalAlignment = Alignment.Bottom,
         ) {
             Text(
-                if (values.isEmpty()) "–" else format(values.last()),
+                if (values.isEmpty()) "–" else if (metric == LiveMetric.ENERGY) com.smartplug.app.util.formatKwhValue(values.last(), com.smartplug.app.util.LocalKwhDecimals.current) else format(values.last()),
                 style = MaterialTheme.typography.headlineLarge,
                 fontWeight = FontWeight.Bold,
             )
@@ -108,11 +169,11 @@ fun LiveMeasurementChart(
                 modifier = Modifier.padding(vertical = 24.dp),
             )
         } else {
-            TickChart(
-                values = values,
-                xLabels = listOf("-4m", "-3m", "-2m", "-1m", "now"),
+            LiveTrendChart(
+                samples = points.map { TimedValue(it.timestampMs, metricValue(it, metric, energyAdjustPercent)) },
+                windowMs = windowMs,
+                labelsForSpan = { span -> (0..4).map { j -> if (j == 4) "now" else formatSpan(span * (4 - j) / 4) } },
                 color = metric.color,
-                animateKey = metric,
             )
         }
     }
@@ -126,11 +187,11 @@ private fun metricName(metric: LiveMetric, language: com.smartplug.app.ui.locali
     LiveMetric.POWER_FACTOR -> "Power factor"
 }
 
-private fun metricValue(point: LiveMeasurementPoint, metric: LiveMetric): Double = when (metric) {
+private fun metricValue(point: LiveMeasurementPoint, metric: LiveMetric, energyAdjustPercent: Double): Double = when (metric) {
     LiveMetric.VOLTAGE -> point.measurement.voltageV
     LiveMetric.CURRENT -> point.measurement.currentA
     LiveMetric.WATT -> point.measurement.activePowerW
-    LiveMetric.ENERGY -> point.measurement.energyWh.coerceAtLeast(0.0) / 1000.0
+    LiveMetric.ENERGY -> com.smartplug.app.util.applyEnergyAdjustment(point.measurement.energyWh.coerceAtLeast(0.0) / 1000.0, energyAdjustPercent)
     LiveMetric.POWER_FACTOR -> point.measurement.powerFactor * 100.0
 }
 

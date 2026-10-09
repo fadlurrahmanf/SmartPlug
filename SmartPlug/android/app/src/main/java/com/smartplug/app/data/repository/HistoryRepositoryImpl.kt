@@ -72,6 +72,10 @@ class HistoryRepositoryImpl @Inject constructor(
         }
     }
 
+    override suspend fun clearCachedHistory(deviceId: String) {
+        historyDao.clearForDevice(deviceId)
+    }
+
     private suspend fun cachedOrFailure(
         device: SmartPlugDevice,
         fromUtcMs: Long,

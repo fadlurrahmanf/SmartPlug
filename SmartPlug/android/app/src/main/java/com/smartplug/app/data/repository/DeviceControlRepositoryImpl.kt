@@ -37,16 +37,60 @@ class DeviceControlRepositoryImpl @Inject constructor(
         }
     }
 
+    // The SmartPlug refuses a new code (409 invite_already_active) while one is still valid and never
+    // reveals it again, so the app keeps its own copy (encrypted) until it expires.
     override suspend fun createMemberInvitation(device: SmartPlugDevice): ApiResult<MemberInvitation> {
         // Invitation creation intentionally goes to the local SmartPlug even in Server mode:
         // the owner credential is device-scoped, never copied to ServerSmartPlug.
         val ip = device.lanIp ?: return ApiResult.Failure(ApiFailure(0, "missing_lan_ip"))
         val bearer = tokenStore.accessCredential(device.deviceId)?.let { "Bearer $it" }
             ?: return ApiResult.Failure(ApiFailure(0, "missing_owner_token"))
-        return safeApiCall {
+        val result = safeApiCall {
             apiClientFactory.deviceApi(ApiClientFactory.lanBaseUrl(ip))
                 .createAccessInvitation(bearer, com.smartplug.app.data.remote.dto.AccessInvitationRequestDto())
         }.map { MemberInvitation(it.inviteCode, it.expiresInSeconds) }
+        if (result is ApiResult.Success) {
+            tokenStore.saveInvitation(
+                device.deviceId, result.value.code,
+                System.currentTimeMillis() + result.value.expiresInSeconds * 1000L,
+            )
+        } else if (result is ApiResult.Failure && result.error.errorCode == "invite_already_active") {
+            val cached = tokenStore.activeInvitation(device.deviceId)
+            val remainingSeconds = cached?.let { (it.second - System.currentTimeMillis()) / 1000L } ?: 0L
+            if (cached != null && remainingSeconds > 0L) {
+                return ApiResult.Success(MemberInvitation(cached.first, remainingSeconds))
+            }
+        }
+        return result
+    }
+
+    override suspend fun setPowerPolicy(
+        device: SmartPlugDevice,
+        policy: com.smartplug.app.domain.model.PowerOnPolicy,
+        restoreDelaySeconds: Int,
+    ): ApiResult<Unit> {
+        if (restoreDelaySeconds !in 0..600) return ApiResult.Failure(ApiFailure(400, "invalid_power_policy"))
+        val ip = device.lanIp ?: return ApiResult.Failure(ApiFailure(0, "missing_lan_ip"))
+        val bearer = tokenStore.accessCredential(device.deviceId)?.let { "Bearer $it" }
+            ?: return ApiResult.Failure(ApiFailure(0, "missing_owner_token"))
+        return safeApiCall {
+            apiClientFactory.deviceApi(ApiClientFactory.lanBaseUrl(ip)).setPowerPolicy(
+                bearer,
+                com.smartplug.app.data.remote.dto.PowerPolicyRequestDto(policy.wire, restoreDelaySeconds),
+            )
+        }
+    }
+
+    override suspend fun setProtection(device: SmartPlugDevice, enabled: Boolean): ApiResult<Unit> {
+        val ip = device.lanIp ?: return ApiResult.Failure(ApiFailure(0, "missing_lan_ip"))
+        val bearer = tokenStore.accessCredential(device.deviceId)?.let { "Bearer $it" }
+            ?: return ApiResult.Failure(ApiFailure(0, "missing_owner_token"))
+        return safeApiCall {
+            apiClientFactory.deviceApi(ApiClientFactory.lanBaseUrl(ip)).setProtection(
+                bearer,
+                com.smartplug.app.data.remote.dto.ProtectionRequestDto(enabled),
+            )
+        }
     }
 
     override suspend fun listManagedMembers(device: SmartPlugDevice): ApiResult<List<ManagedMember>> {
