@@ -1,5 +1,11 @@
 # SmartPlug
 
+## Download aplikasi Android
+
+Unduh APK Android terbaru: [**SmartPlugApp-latest.apk**](https://github.com/fadlurrahmanf/SmartPlug/releases/latest/download/SmartPlugApp-latest.apk).
+
+Versi, checksum, dan catatan perubahan tersedia di halaman [GitHub Releases](https://github.com/fadlurrahmanf/SmartPlug/releases/latest).
+
 ## Datasheet board
 
 Dokumen publik untuk memahami board dan wiring terdapat pada

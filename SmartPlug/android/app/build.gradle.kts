@@ -13,8 +13,8 @@ android {
         applicationId = "com.smartplug.app"
         minSdk = 29
         targetSdk = 34
-        versionCode = 69
-        versionName = "0.1.68"
+        versionCode = 70
+        versionName = "0.1.69"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables { useSupportLibrary = true }
@@ -107,6 +107,8 @@ dependencies {
     // Persistence
     implementation("androidx.datastore:datastore-preferences:1.1.1")
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
+    // Required by Tink when R8 minifies the installable release APK.
+    implementation("com.google.errorprone:error_prone_annotations:2.27.1")
     implementation("androidx.room:room-runtime:2.6.1")
     implementation("androidx.room:room-ktx:2.6.1")
     kapt("androidx.room:room-compiler:2.6.1")
