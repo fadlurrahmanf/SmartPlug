@@ -15,6 +15,7 @@ import com.smartplug.app.domain.model.SmartPlugDevice
 import com.smartplug.app.data.remote.dto.ServerScheduleRequestDto
 import com.smartplug.app.data.remote.dto.ServerTimerRequestDto
 import com.smartplug.app.domain.repository.DeviceControlRepository
+import kotlinx.coroutines.delay
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -121,24 +122,50 @@ class DeviceControlRepositoryImpl @Inject constructor(
         IntegrationMode.SERVER -> server(device) { api, bearer -> api.resetEnergy(bearer, device.deviceId, energyConfirmation()) }
     }
 
-    override suspend fun factoryReset(device: SmartPlugDevice): ApiResult<Unit> = when (device.integrationMode) {
-        IntegrationMode.DIRECT -> direct(device) { api, bearer -> api.factoryReset(bearer, factoryConfirmation()) }
-        IntegrationMode.SERVER -> server(device) { api, bearer -> api.factoryReset(bearer, device.deviceId, factoryConfirmation()) }
+    override suspend fun factoryReset(device: SmartPlugDevice): ApiResult<Unit> {
+        // The local endpoint answers only after the SmartPlug has wiped itself, so its
+        // success proves the reset. A server-mode device keeps its local owner-token API;
+        // MQTT through ServerSmartPlug is the remote fallback.
+        val local = direct(device) { api, bearer -> api.factoryReset(bearer, factoryConfirmation()) }
+        if (local is ApiResult.Success || device.integrationMode == IntegrationMode.DIRECT) return local
+        return factoryResetViaServer(device)
     }
 
-    override suspend fun factoryResetForGlobalReset(device: SmartPlugDevice): ApiResult<Unit> {
-        // The server endpoint returns once a reset command is queued. That is the
-        // correct asynchronous behaviour for remote control, but a global reset
-        // must not reset its broker before the local SmartPlug has received the
-        // command. Prefer the directly acknowledged local endpoint first.
-        val local = direct(device) { api, bearer -> api.factoryReset(bearer, factoryConfirmation()) }
-        if (local is ApiResult.Success) return local
-        return when (device.integrationMode) {
-            IntegrationMode.DIRECT -> local
-            IntegrationMode.SERVER -> server(device) { api, bearer ->
-                api.factoryReset(bearer, device.deviceId, factoryConfirmation())
-            }
+    override suspend fun factoryResetForGlobalReset(device: SmartPlugDevice): ApiResult<Unit> = factoryReset(device)
+
+    /**
+     * ServerSmartPlug answers once the MQTT command is queued, not once the SmartPlug ran it,
+     * and the firmware sends no acknowledgement. A reset SmartPlug has lost its broker
+     * settings, so it drops offline and never returns; a plug that missed or rejected the
+     * command stays online, and a plain reboot reconnects within seconds. Success is only
+     * reported when the device was online before the command and then stays offline.
+     */
+    private suspend fun factoryResetViaServer(device: SmartPlugDevice): ApiResult<Unit> {
+        when (val before = serverDeviceStatus(device)) {
+            is ApiResult.Failure -> return before
+            is ApiResult.Success -> if (before.value != "online") return ApiResult.Failure(ApiFailure(0, "device_offline"))
         }
+        val queued = server(device) { api, bearer -> api.factoryReset(bearer, device.deviceId, factoryConfirmation()) }
+        if (queued is ApiResult.Failure) return queued
+        var waitedMs = 0L
+        var offlineForMs = 0L
+        while (waitedMs < FACTORY_RESET_CONFIRM_TIMEOUT_MS) {
+            delay(FACTORY_RESET_POLL_MS)
+            waitedMs += FACTORY_RESET_POLL_MS
+            val status = serverDeviceStatus(device) as? ApiResult.Success<String> ?: continue
+            offlineForMs = if (status.value == "offline") offlineForMs + FACTORY_RESET_POLL_MS else 0L
+            if (offlineForMs > FACTORY_RESET_OFFLINE_HOLD_MS) return ApiResult.Success(Unit)
+        }
+        return ApiResult.Failure(ApiFailure(0, "factory_reset_unconfirmed"))
+    }
+
+    private suspend fun serverDeviceStatus(device: SmartPlugDevice): ApiResult<String> {
+        val host = device.serverHost ?: return ApiResult.Failure(ApiFailure(0, "missing_server_host"))
+        val bearer = device.serverId?.let(tokenStore::serverApiToken)?.let { "Bearer $it" }
+            ?: return ApiResult.Failure(ApiFailure(0, "missing_server_token"))
+        return safeApiCall {
+            apiClientFactory.serverApi(ApiClientFactory.hostBaseUrl(host, device.serverPort)).getLatest(bearer, device.deviceId)
+        }.map { it.status }
     }
 
     override suspend fun applyTimer(
@@ -277,6 +304,13 @@ class DeviceControlRepositoryImpl @Inject constructor(
         "action" to action,
         "timezone_offset_minutes" to timezoneOffsetMinutes.coerceIn(-720, 840).toString(),
     )
+
+    private companion object {
+        const val FACTORY_RESET_POLL_MS = 3_000L
+        // MQTT keepalive is 30 s, so the broker's last will can take ~45 s to mark the plug offline.
+        const val FACTORY_RESET_CONFIRM_TIMEOUT_MS = 120_000L
+        const val FACTORY_RESET_OFFLINE_HOLD_MS = 15_000L
+    }
 }
 
 private fun com.smartplug.app.data.remote.dto.DeviceScheduleDto.toSchedule() = DeviceSchedule(

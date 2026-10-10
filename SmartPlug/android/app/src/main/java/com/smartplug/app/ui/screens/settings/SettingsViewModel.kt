@@ -25,7 +25,6 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.delay
 import javax.inject.Inject
 
 data class AppResetUiState(
@@ -115,9 +114,8 @@ class SettingsViewModel @Inject constructor(
                 is ApiResult.Failure -> failedNames += device.displayName
             }
         }
-        // A SERVER-mode SmartPlug receives the broker command above. Give its normal MQTT
-        // delivery path time to execute before its broker is factory-reset as well.
-        if (devices.any { it.integrationMode.name == "SERVER" }) delay(2_000)
+        // A SERVER-mode SmartPlug reset over MQTT only counts as reset once it has gone
+        // offline, so its broker can be factory-reset right after.
         servers.forEach { server ->
             val token = serverProfileStore.apiToken(server.serverId)
             if (token == null) {

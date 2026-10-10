@@ -6,6 +6,7 @@ import com.smartplug.app.data.local.ServerProfileStore
 import com.smartplug.app.data.local.db.HistoryDao
 import com.smartplug.app.data.local.db.LoadSignatureDao
 import com.smartplug.app.data.remote.ApiResult
+import com.smartplug.app.domain.model.ApiFailure
 import com.smartplug.app.domain.model.DeviceStatus
 import com.smartplug.app.domain.model.ElectricalMeasurement
 import com.smartplug.app.domain.model.HistoryResolution
@@ -53,6 +54,23 @@ data class DeviceListUiState(
     /** Devices whose relay command is in flight. */
     val relayBusy: Set<String> = emptySet(),
 )
+
+/** Progress and outcome of a factory reset started from the device list. */
+data class FactoryResetNotice(
+    val resettingName: String? = null,
+    val message: String? = null,
+    val failed: Boolean = false,
+)
+
+internal fun factoryResetFailureText(failure: ApiFailure): String = when (failure.errorCode) {
+    "device_offline" -> "SmartPlug sedang offline di server, jadi perintah reset tidak akan sampai. Pastikan SmartPlug online atau satu jaringan dengan HP."
+    "factory_reset_unconfirmed" -> "perintah sudah dikirim lewat server, tetapi SmartPlug tidak terkonfirmasi ter-reset. Profil tetap disimpan; coba lagi dari jaringan yang sama atau reset lewat portal lokal perangkat."
+    "network_timeout", "no_connectivity" -> "perangkat tidak dapat dijangkau. Periksa koneksi Wi-Fi."
+    "missing_lan_ip", "missing_server_host" -> "alamat perangkat belum diketahui."
+    "missing_owner_token", "missing_server_token", "invalid_owner_token" -> "kredensial pemilik tidak tersedia di HP ini."
+    "rate_limited" -> "terlalu cepat, coba lagi beberapa detik lagi."
+    else -> failure.message ?: "terjadi kesalahan (${failure.errorCode})."
+}
 
 @HiltViewModel
 class DeviceListViewModel @Inject constructor(
@@ -210,15 +228,35 @@ class DeviceListViewModel @Inject constructor(
         }
     }
 
-    /** Same factory-reset command as the detail menu; the profile is only removed once it is accepted. */
+    private val _factoryResetNotice = MutableStateFlow(FactoryResetNotice())
+    val factoryResetNotice: StateFlow<FactoryResetNotice> = _factoryResetNotice
+
+    /** Same factory-reset command as the detail menu; the profile is only removed once the SmartPlug confirmed it. */
     fun factoryReset(device: SmartPlugDevice) {
-        safeLaunch {
-            if (deviceControlRepository.factoryReset(device) is ApiResult.Success) {
-                historyDao.clearForDevice(device.deviceId)
-                loadSignatureDao.clearForDevice(device.deviceId)
-                deviceRepository.removeDevice(device.deviceId)
+        if (_factoryResetNotice.value.resettingName != null) return
+        _factoryResetNotice.value = FactoryResetNotice(resettingName = device.displayName)
+        safeLaunch(onError = {
+            _factoryResetNotice.value = FactoryResetNotice(message = "Factory reset ${device.displayName} gagal.", failed = true)
+        }) {
+            when (val result = deviceControlRepository.factoryReset(device)) {
+                is ApiResult.Success -> {
+                    historyDao.clearForDevice(device.deviceId)
+                    loadSignatureDao.clearForDevice(device.deviceId)
+                    deviceRepository.removeDevice(device.deviceId)
+                    _factoryResetNotice.value = FactoryResetNotice(
+                        message = "${device.displayName} sudah di-factory-reset dan dihapus dari aplikasi.",
+                    )
+                }
+                is ApiResult.Failure -> _factoryResetNotice.value = FactoryResetNotice(
+                    message = "Factory reset ${device.displayName} gagal: ${factoryResetFailureText(result.error)}",
+                    failed = true,
+                )
             }
         }
+    }
+
+    fun dismissFactoryResetNotice() {
+        if (_factoryResetNotice.value.resettingName == null) _factoryResetNotice.value = FactoryResetNotice()
     }
 
     /** Local unpair of a ServerSmartPlug profile; the physical server and its plugs are untouched. */

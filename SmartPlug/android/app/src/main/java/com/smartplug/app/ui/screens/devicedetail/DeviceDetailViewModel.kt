@@ -67,6 +67,10 @@ data class DeviceDetailUiState(
     val limit: EnergyLimit = EnergyLimit(),
     /** Incremented each time an ON request is refused because the kWh limit is reached. */
     val limitBlockedNonce: Int = 0,
+    /** A server-routed factory reset waits up to two minutes for the SmartPlug to drop offline. */
+    val isFactoryResetting: Boolean = false,
+    /** Kept apart from lastError, which polling overwrites. */
+    val factoryResetError: String? = null,
 )
 
 data class LiveMeasurementPoint(val timestampMs: Long, val measurement: ElectricalMeasurement)
@@ -503,7 +507,28 @@ class DeviceDetailViewModel @Inject constructor(
 
     fun resetEnergy() = runControl("Reset energi ditolak") { device -> deviceControlRepository.resetEnergy(device) }
 
-    fun factoryReset() = runControl("Factory reset ditolak") { device -> deviceControlRepository.factoryReset(device) }
+    /** Removes the profile only once the SmartPlug itself confirmed the reset, like the device list. */
+    fun factoryReset() {
+        val device = _uiState.value.device ?: return
+        if (_uiState.value.isFactoryResetting) return
+        _uiState.value = _uiState.value.copy(isFactoryResetting = true, factoryResetError = null)
+        safeLaunch(onError = {
+            _uiState.value = _uiState.value.copy(isFactoryResetting = false, factoryResetError = "Factory reset ditolak")
+        }) {
+            when (val result = deviceControlRepository.factoryReset(device)) {
+                is ApiResult.Success -> {
+                    historyDao.clearForDevice(device.deviceId)
+                    loadSignatureDao.clearForDevice(device.deviceId)
+                    deviceRepository.removeDevice(device.deviceId)
+                    _uiState.value = _uiState.value.copy(isFactoryResetting = false, isRemoved = true)
+                }
+                is ApiResult.Failure -> _uiState.value = _uiState.value.copy(
+                    isFactoryResetting = false,
+                    factoryResetError = "Factory reset gagal: " + com.smartplug.app.ui.screens.devices.factoryResetFailureText(result.error),
+                )
+            }
+        }
+    }
 
     fun applyTimer(hours: Int, minutes: Int, seconds: Int, onSuccess: () -> Unit) {
         // The composable disables Apply at zero, but keep the command boundary

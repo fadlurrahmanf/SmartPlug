@@ -221,6 +221,7 @@ fun DeviceDetailScreen(
                         DropdownMenuItem(
                             text = { Text(localized(language, "Reset pabrik", "Factory reset")) },
                             onClick = { showMenu = false; confirmAction = ConfirmAction.FACTORY_RESET },
+                            enabled = !uiState.isFactoryResetting,
                         )
                     }
                 },
@@ -369,6 +370,15 @@ fun DeviceDetailScreen(
 
 
             uiState.lastError?.let { error ->
+                Text(error, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium)
+            }
+            if (uiState.isFactoryResetting) {
+                Text(
+                    localized(language, "Mereset pabrik… menunggu konfirmasi dari SmartPlug (maks. 2 menit).", "Factory resetting… waiting for the SmartPlug to confirm (up to 2 minutes)."),
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            }
+            uiState.factoryResetError?.let { error ->
                 Text(error, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium)
             }
         }

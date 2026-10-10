@@ -71,6 +71,7 @@ fun DeviceListScreen(
     viewModel: DeviceListViewModel = hiltViewModel(),
 ) {
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
+    val resetNotice by viewModel.factoryResetNotice.collectAsStateWithLifecycle()
     val language = LocalAppLanguage.current
     var addDeviceChooserOpen by remember { mutableStateOf(false) }
     var unpairTarget by remember { mutableStateOf<SmartPlugDevice?>(null) }
@@ -110,12 +111,24 @@ fun DeviceListScreen(
                 contentPadding = androidx.compose.foundation.layout.PaddingValues(16.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
+                resetNotice.resettingName?.let { name ->
+                    item(key = "factory-reset-progress") {
+                        Text(
+                            localized(
+                                language,
+                                "Mereset pabrik $name… menunggu konfirmasi dari SmartPlug (maks. 2 menit).",
+                                "Factory resetting $name… waiting for the SmartPlug to confirm (up to 2 minutes).",
+                            ),
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                    }
+                }
                 itemsIndexed(uiState.rows, key = { _, row -> row.device.deviceId }) { index, row ->
                     SwipeRevealRow(
                         modifier = Modifier.entrance(index),
                         actions = { close ->
                             ActionCell(localized(language, "Reset", "Reset"), MaterialTheme.colorScheme.surfaceVariant, MaterialTheme.colorScheme.onSurface) {
-                                close(); resetTarget = row.device
+                                close(); if (resetNotice.resettingName == null) resetTarget = row.device
                             }
                             ActionCell(localized(language, "Lepas", "Unpair"), AccentRed, Color.White) {
                                 close(); unpairTarget = row.device
@@ -224,6 +237,20 @@ fun DeviceListScreen(
                     onClick = { viewModel.factoryReset(device); resetTarget = null },
                 ) { Text(localized(language, "Reset", "Reset"), color = MaterialTheme.colorScheme.error) }
             },
+        )
+    }
+
+    resetNotice.message?.let { message ->
+        SheetDialog(
+            onDismissRequest = viewModel::dismissFactoryResetNotice,
+            title = {
+                Text(
+                    if (resetNotice.failed) localized(language, "Reset pabrik gagal", "Factory reset failed")
+                    else localized(language, "Reset pabrik selesai", "Factory reset complete"),
+                )
+            },
+            text = { Text(message, color = if (resetNotice.failed) MaterialTheme.colorScheme.error else Color.Unspecified) },
+            confirmButton = { TextButton(onClick = viewModel::dismissFactoryResetNotice) { Text("OK") } },
         )
     }
 
