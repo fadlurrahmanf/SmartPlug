@@ -2,7 +2,7 @@
 
 ## Download aplikasi Android
 
-Unduh APK Android terbaru: [**SmartPlugApp-latest.apk**](https://github.com/fadlurrahmanf/SmartPlug/releases/latest/download/SmartPlugApp-latest.apk).
+Unduh APK Android terbaru: [**SmartPlugApp-latest.apk**](downloads/SmartPlugApp-latest.apk).
 
 Versi, checksum, dan catatan perubahan tersedia di halaman [GitHub Releases](https://github.com/fadlurrahmanf/SmartPlug/releases/latest).
 
