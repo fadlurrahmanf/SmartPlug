@@ -2,7 +2,7 @@
 
 ## Download aplikasi Android
 
-Unduh APK terbaru: [**SmartPlugApp-latest.apk**](SmartPlug/downloads/SmartPlugApp-latest.apk).
+Unduh APK terbaru: [**SmartPlugApp-latest.apk**](https://github.com/fadlurrahmanf/SmartPlug/raw/refs/heads/master/SmartPlug/downloads/SmartPlugApp-latest.apk).
 
 Open source reference implementation for the SmartPlug Android application,
 SmartPlug firmware, and ServerSmartPlug firmware.
