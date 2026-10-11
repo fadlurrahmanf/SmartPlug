@@ -15,6 +15,7 @@
 /SmartPlug/android/*.keystore
 /SmartPlug/android/*.jks
 /SmartPlug/android/logcat*.txt
+/SmartPlug/downloads/*.idsig
 
 # Firmware build state and distributable binaries are released separately.
 /SmartPlug/firmware/.pio/
