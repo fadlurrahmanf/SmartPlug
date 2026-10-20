@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="1420" height="900" viewBox="0 0 1420 900">
+  <rect width="1420" height="900" fill="#10131a"/>
+  <style>
+    .h { font: 700 30px Arial, sans-serif; fill: #fff; }
+    .s { font: 600 20px Arial, sans-serif; fill: #f5f7fb; }
+    .n { font: 600 16px Arial, sans-serif; fill: #10131a; }
+    .note { font: 600 18px Arial, sans-serif; fill: #ffd166; }
+    .box { fill: #fff; stroke-width: 5; rx: 12; }
+  </style>
+
+  <text class="h" x="45" y="52">Sambungan SSR Omron G3MB-202P ke PCB SmartPlug</text>
+  <text class="note" x="45" y="82">Sambungkan saat listrik PLN benar-benar dicabut.</text>
+
+  <text class="s" x="135" y="122">PCB SmartPlug — titik bekas relay HFE20</text>
+  <image x="45" y="145" width="457" height="711" preserveAspectRatio="xMidYMid meet"
+    xlink:href="file:///C:/WINDOWS/TEMP/codex-clipboard-8d9bf277-c9f5-4855-a8d8-3a82b55fd9f0.png"/>
+
+  <text class="s" x="940" y="122">SSR Omron G3MB-202P</text>
+  <image x="825" y="150" width="530" height="421" preserveAspectRatio="xMidYMid meet"
+    xlink:href="file:///C:/WINDOWS/TEMP/codex-clipboard-9e9830e4-4415-462d-afd9-8421beaf6319.png"/>
+
+  <!-- PCB source pads, based on the HFE20 footprint/net names in the PCB file. -->
+  <circle cx="265" cy="807" r="15" fill="#f44336" stroke="#fff" stroke-width="4"/>
+  <rect class="box" x="55" y="764" width="170" height="46" stroke="#f44336"/>
+  <text class="n" x="70" y="794">PCB +5V</text>
+
+  <circle cx="297" cy="807" r="15" fill="#00c853" stroke="#fff" stroke-width="4"/>
+  <rect class="box" x="315" y="764" width="180" height="46" stroke="#00c853"/>
+  <text class="n" x="331" y="794">PCB SET1</text>
+
+  <circle cx="297" cy="625" r="15" fill="#ffb300" stroke="#fff" stroke-width="4"/>
+  <rect class="box" x="315" y="585" width="185" height="46" stroke="#ffb300"/>
+  <text class="n" x="329" y="615">PCB OUT</text>
+
+  <circle cx="231" cy="580" r="15" fill="#00b0ff" stroke="#fff" stroke-width="4"/>
+  <rect class="box" x="48" y="540" width="220" height="46" stroke="#00b0ff"/>
+  <text class="n" x="62" y="570">PCB NET_OUT</text>
+
+  <!-- SSR destination labels. The labels identify the physical pin number on the component. -->
+  <rect class="box" x="1050" y="590" width="190" height="50" stroke="#f44336"/>
+  <text class="n" x="1065" y="622">SSR pin 3 (+)</text>
+  <rect class="box" x="1050" y="660" width="190" height="50" stroke="#00c853"/>
+  <text class="n" x="1065" y="692">SSR pin 4 (−)</text>
+  <rect class="box" x="1050" y="730" width="190" height="50" stroke="#ffb300"/>
+  <text class="n" x="1065" y="762">SSR pin 1 (~AC)</text>
+  <rect class="box" x="1050" y="800" width="190" height="50" stroke="#00b0ff"/>
+  <text class="n" x="1065" y="832">SSR pin 2 (~AC)</text>
+
+  <path d="M265 807 C560 807, 730 615, 1050 615" fill="none" stroke="#f44336" stroke-width="7"/>
+  <path d="M297 807 C590 807, 760 685, 1050 685" fill="none" stroke="#00c853" stroke-width="7"/>
+  <path d="M297 625 C610 625, 760 755, 1050 755" fill="none" stroke="#ffb300" stroke-width="7"/>
+  <path d="M231 580 C540 580, 735 825, 1050 825" fill="none" stroke="#00b0ff" stroke-width="7"/>
+
+  <text class="note" x="550" y="875">Pin 1 dan 2 boleh ditukar. Jangan gunakan RST1.</text>
+</svg>
