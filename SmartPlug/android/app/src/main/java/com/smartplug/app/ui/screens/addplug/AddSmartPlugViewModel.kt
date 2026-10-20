@@ -11,6 +11,7 @@ import com.smartplug.app.domain.model.PairingFailureReason
 import com.smartplug.app.domain.model.PairingState
 import com.smartplug.app.domain.model.SmartPlugDevice
 import com.smartplug.app.domain.repository.DeviceRepository
+import com.smartplug.app.domain.repository.DeviceControlRepository
 import com.smartplug.app.domain.repository.DiscoveryRepository
 import com.smartplug.app.domain.repository.PairingRepository
 import com.smartplug.app.domain.repository.WifiOnboardingRepository
@@ -20,6 +21,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.takeWhile
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -35,6 +37,7 @@ class AddSmartPlugViewModel @Inject constructor(
     private val wifiOnboardingRepository: WifiOnboardingRepository,
     private val pairingRepository: PairingRepository,
     private val deviceRepository: DeviceRepository,
+    private val deviceControlRepository: DeviceControlRepository,
     private val tokenStore: SecureTokenStore,
     private val discoveryRepository: DiscoveryRepository,
 ) : ViewModel() {
@@ -81,10 +84,17 @@ class AddSmartPlugViewModel @Inject constructor(
         launchSafely {
             wifiOnboardingRepository.scanForSmartPlugAps()
                 .onSuccess { aps ->
-                    // A factory-reset SmartPlug keeps its AP/unit ID, while the old profile can
-                    // still be in Room.  Do not hide that AP: the normal pairing flow will
-                    // upsert the refreshed profile and credentials after it reconnects.
-                    _uiState.value = _uiState.value.copy(discoveredAps = aps, isScanningDevices = false)
+                    // A SmartPlug that is already paired keeps broadcasting its setup AP, so hide
+                    // every unit whose AP id is registered in this app; only unpaired plugs
+                    // should be offered. A plug factory-reset from the app has its profile
+                    // removed first, so it reappears here automatically.
+                    val pairedUnitIds = deviceRepository.observeDevices().first()
+                        .mapNotNull { it.apUnitId }
+                        .toSet()
+                    _uiState.value = _uiState.value.copy(
+                        discoveredAps = aps.filterNot { it.unitId in pairedUnitIds },
+                        isScanningDevices = false,
+                    )
                 }
                 .onFailure { e ->
                     _uiState.value = _uiState.value.copy(
@@ -220,12 +230,14 @@ class AddSmartPlugViewModel @Inject constructor(
             pairingRepository.pollStatus(token, configurationId).takeWhile { result ->
                 when (result) {
                     is ApiResult.Success -> when (result.value.state) {
-                        PairingState.CONNECTED -> {
+                        PairingState.PAIRING_PENDING, PairingState.CONNECTED -> {
                             finalizeOnboarding(
                                 deviceId = result.value.deviceId ?: _uiState.value.expectedDeviceId.orEmpty(),
                                 staMac = result.value.staMac.orEmpty(),
                                 lanIp = result.value.lanIp,
                                 ownerToken = result.value.ownerToken,
+                                pairingToken = token,
+                                configurationId = configurationId,
                             )
                             false
                         }
@@ -290,12 +302,14 @@ class AddSmartPlugViewModel @Inject constructor(
                     ApiClientFactory.lanBaseUrl(lanIp), pairingToken, configurationId,
                 )) {
                     is ApiResult.Success -> when (lanStatus.value.state) {
-                        PairingState.CONNECTED -> {
+                        PairingState.PAIRING_PENDING, PairingState.CONNECTED -> {
                             finalizeOnboarding(
                                 deviceId = lanStatus.value.deviceId ?: deviceId,
                                 staMac = lanStatus.value.staMac.orEmpty(),
                                 lanIp = lanStatus.value.lanIp ?: lanIp,
                                 ownerToken = lanStatus.value.ownerToken,
+                                pairingToken = pairingToken,
+                                configurationId = configurationId,
                             )
                             return
                         }
@@ -317,7 +331,14 @@ class AddSmartPlugViewModel @Inject constructor(
         _uiState.value = _uiState.value.copy(step = OnboardingStep.FAILED, errorMessage = lastProblem)
     }
 
-    private suspend fun finalizeOnboarding(deviceId: String, staMac: String, lanIp: String?, ownerToken: String?) {
+    private suspend fun finalizeOnboarding(
+        deviceId: String,
+        staMac: String,
+        lanIp: String?,
+        ownerToken: String?,
+        pairingToken: String,
+        configurationId: String,
+    ) {
         if (lanIp == null || ownerToken == null) {
             _uiState.value = _uiState.value.copy(
                 step = OnboardingStep.FAILED,
@@ -355,13 +376,60 @@ class AddSmartPlugViewModel @Inject constructor(
 
         when (val verify = deviceRepository.verifyDeviceIdentity(device)) {
             is ApiResult.Success -> if (verify.value) {
-                deviceRepository.saveDevice(device)
-                _uiState.value = _uiState.value.copy(
-                    step = OnboardingStep.SUCCESS,
-                    resultDeviceId = deviceId,
-                    resultLanIp = lanIp,
-                    resultDisplayName = displayName,
-                )
+                when (val rename = deviceControlRepository.setSharedDisplayName(device, displayName)) {
+                    is ApiResult.Success -> {
+                        val savedLocally = try {
+                        // A successful local write is part of the handshake. If it fails, do
+                        // not leave an owner credential behind on the SmartPlug.
+                            deviceRepository.saveDevice(device)
+                            true
+                    } catch (_: Exception) {
+                        pairingRepository.abortPairingAt(
+                            ApiClientFactory.lanBaseUrl(lanIp), pairingToken, ownerToken, configurationId,
+                        )
+                        _uiState.value = _uiState.value.copy(
+                            step = OnboardingStep.FAILED,
+                            errorMessage = "Profil lokal gagal disimpan; SmartPlug kembali siap dipasang.",
+                        )
+                            false
+                        }
+                        if (!savedLocally) return
+                        when (val complete = pairingRepository.completePairingAt(
+                        baseUrl = ApiClientFactory.lanBaseUrl(lanIp),
+                        pairingToken = pairingToken,
+                        ownerToken = ownerToken,
+                        configurationId = configurationId,
+                    )) {
+                        is ApiResult.Success -> {
+                            _uiState.value = _uiState.value.copy(
+                                step = OnboardingStep.SUCCESS,
+                                resultDeviceId = deviceId,
+                                resultLanIp = lanIp,
+                                resultDisplayName = displayName,
+                            )
+                        }
+                        is ApiResult.Failure -> {
+                            deviceRepository.removeDevice(deviceId)
+                            pairingRepository.abortPairingAt(
+                                ApiClientFactory.lanBaseUrl(lanIp), pairingToken, ownerToken, configurationId,
+                            )
+                            _uiState.value = _uiState.value.copy(
+                                step = OnboardingStep.FAILED,
+                                errorMessage = "Konfirmasi pairing gagal (${complete.error.errorCode}); SmartPlug kembali siap dipasang.",
+                            )
+                        }
+                        }
+                    }
+                    is ApiResult.Failure -> {
+                        pairingRepository.abortPairingAt(
+                            ApiClientFactory.lanBaseUrl(lanIp), pairingToken, ownerToken, configurationId,
+                        )
+                        _uiState.value = _uiState.value.copy(
+                            step = OnboardingStep.FAILED,
+                            errorMessage = "Nama SmartPlug gagal disimpan (${rename.error.errorCode}); SmartPlug kembali siap dipasang.",
+                        )
+                    }
+                }
             } else {
                 _uiState.value = _uiState.value.copy(
                     step = OnboardingStep.FAILED,
@@ -387,9 +455,17 @@ class AddSmartPlugViewModel @Inject constructor(
         val name = _uiState.value.resultDisplayName.trim()
         if (name.isBlank()) return
         launchSafely {
-            deviceRepository.renameDevice(deviceId, name)
-            _uiState.value = _uiState.value.copy(resultDisplayName = name)
-            onSaved(deviceId)
+            val device = deviceRepository.getDevice(deviceId) ?: return@launchSafely
+            when (deviceControlRepository.setSharedDisplayName(device, name)) {
+                is ApiResult.Success -> {
+                    deviceRepository.renameDevice(deviceId, name)
+                    _uiState.value = _uiState.value.copy(resultDisplayName = name)
+                    onSaved(deviceId)
+                }
+                is ApiResult.Failure -> _uiState.value = _uiState.value.copy(
+                    errorMessage = "Nama belum tersimpan di SmartPlug. Coba lagi.",
+                )
+            }
         }
     }
 

@@ -123,6 +123,7 @@ enum class PairingState {
     UNPROVISIONED,
     PAIRING,
     CONNECTING,
+    PAIRING_PENDING,
     CONNECTED,
     FAILED,
 }

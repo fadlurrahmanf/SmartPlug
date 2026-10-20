@@ -11,7 +11,9 @@ import com.smartplug.app.domain.model.IntegrationMode
 import com.smartplug.app.domain.model.PairInfo
 import com.smartplug.app.domain.model.PairingState
 import com.smartplug.app.domain.model.PairingStatus
+import com.smartplug.app.domain.model.SmartPlugDevice
 import com.smartplug.app.domain.repository.DeviceRepository
+import com.smartplug.app.domain.repository.DeviceControlRepository
 import com.smartplug.app.domain.repository.DiscoveryRepository
 import com.smartplug.app.domain.repository.PairingRepository
 import com.smartplug.app.domain.repository.WifiOnboardingRepository
@@ -49,6 +51,7 @@ class AddSmartPlugViewModelTest {
     private lateinit var wifi: WifiOnboardingRepository
     private lateinit var pairing: PairingRepository
     private lateinit var devices: DeviceRepository
+    private lateinit var deviceControl: DeviceControlRepository
     private lateinit var tokens: SecureTokenStore
     private lateinit var discovery: DiscoveryRepository
 
@@ -58,6 +61,7 @@ class AddSmartPlugViewModelTest {
         wifi = mockk(relaxed = true)
         pairing = mockk(relaxed = true)
         devices = mockk(relaxed = true)
+        deviceControl = mockk(relaxed = true)
         tokens = mockk(relaxed = true)
         discovery = mockk(relaxed = true)
 
@@ -65,6 +69,7 @@ class AddSmartPlugViewModelTest {
         every { wifi.isLocationServiceRequiredAndDisabled() } returns false
         coEvery { wifi.scanForSmartPlugAps() } returns Result.success(emptyList())
         every { tokens.savedWifiPassword(any()) } returns null
+        every { devices.observeDevices() } returns flowOf(emptyList())
         coEvery { pairing.fetchPairInfo() } returns ApiResult.Success(pairInfo)
         coEvery { pairing.scanHomeWifi("pair-token") } returns ApiResult.Success(
             listOf(HomeWifiNetwork("Mimi", -42, "secured")),
@@ -73,6 +78,9 @@ class AddSmartPlugViewModelTest {
             ApiResult.Success("config-1")
         coEvery { wifi.awaitHomeWifiRestored(any()) } returns true
         coEvery { devices.verifyDeviceIdentity(any()) } returns ApiResult.Success(true)
+        coEvery { deviceControl.setSharedDisplayName(any(), any()) } returns ApiResult.Success(Unit)
+        coEvery { pairing.completePairingAt(any(), "pair-token", "owner-token", "config-1") } returns
+            ApiResult.Success(Unit)
     }
 
     @After
@@ -85,7 +93,7 @@ class AddSmartPlugViewModelTest {
         every { pairing.pollStatus("pair-token", "config-1") } returns flowOf(
             ApiResult.Success(connectedStatus),
         )
-        val viewModel = AddSmartPlugViewModel(wifi, pairing, devices, tokens, discovery)
+        val viewModel = AddSmartPlugViewModel(wifi, pairing, devices, deviceControl, tokens, discovery)
 
         completeDirectSetup(viewModel)
 
@@ -101,6 +109,8 @@ class AddSmartPlugViewModelTest {
                     device.serverHost == null
             })
         }
+        coVerify(exactly = 1) { deviceControl.setSharedDisplayName(any(), any()) }
+        coVerify(exactly = 1) { pairing.completePairingAt(any(), "pair-token", "owner-token", "config-1") }
         verify(exactly = 1) { pairing.pollStatus("pair-token", "config-1") }
         verify(exactly = 1) { wifi.releaseApBinding() }
     }
@@ -116,7 +126,7 @@ class AddSmartPlugViewModelTest {
         coEvery {
             pairing.fetchStatusAt(any(), "pair-token", "config-1")
         } returns ApiResult.Success(connectedStatus)
-        val viewModel = AddSmartPlugViewModel(wifi, pairing, devices, tokens, discovery)
+        val viewModel = AddSmartPlugViewModel(wifi, pairing, devices, deviceControl, tokens, discovery)
 
         completeDirectSetup(viewModel)
 
@@ -134,6 +144,42 @@ class AddSmartPlugViewModelTest {
         coVerify(exactly = 1) {
             devices.saveDevice(match { it.integrationMode == IntegrationMode.DIRECT && it.serverId == null })
         }
+    }
+
+    @Test
+    fun `scan hides already paired SmartPlugs and lists only unpaired ones`() = runTest {
+        every { devices.observeDevices() } returns flowOf(
+            listOf(
+                SmartPlugDevice(
+                    deviceId = "SP-AABBCCDDEEFF",
+                    staMac = "AA:BB:CC:DD:EE:FF",
+                    displayName = "Paired",
+                    lanIp = "192.168.1.29",
+                    integrationMode = IntegrationMode.DIRECT,
+                    apUnitId = "1122",
+                ),
+                // Added through "Existing SmartPlug": no AP id, so it can never hide an AP.
+                SmartPlugDevice(
+                    deviceId = "SP-112233445566",
+                    staMac = "11:22:33:44:55:66",
+                    displayName = "Existing",
+                    lanIp = null,
+                    integrationMode = IntegrationMode.DIRECT,
+                    apUnitId = null,
+                ),
+            ),
+        )
+        coEvery { wifi.scanForSmartPlugAps() } returns Result.success(
+            listOf(
+                DiscoveredSmartPlugAp("SP-1122", "1122", -35),
+                DiscoveredSmartPlugAp("SP-3344", "3344", -50),
+            ),
+        )
+
+        val viewModel = AddSmartPlugViewModel(wifi, pairing, devices, deviceControl, tokens, discovery)
+        dispatcher.scheduler.advanceUntilIdle()
+
+        assertThat(viewModel.uiState.value.discoveredAps.map { it.unitId }).containsExactly("3344")
     }
 
     private fun completeDirectSetup(viewModel: AddSmartPlugViewModel) {

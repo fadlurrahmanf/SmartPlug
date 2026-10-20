@@ -82,6 +82,18 @@ interface PairingRepository {
         pairingToken: String,
         configurationId: String,
     ): ApiResult<PairingStatus>
+    suspend fun completePairingAt(
+        baseUrl: String,
+        pairingToken: String,
+        ownerToken: String,
+        configurationId: String,
+    ): ApiResult<Unit>
+    suspend fun abortPairingAt(
+        baseUrl: String,
+        pairingToken: String,
+        ownerToken: String,
+        configurationId: String,
+    ): ApiResult<Unit>
 }
 
 /** Local device registry + operational status/measurement reads, routed by [SmartPlugDevice.integrationMode]. */

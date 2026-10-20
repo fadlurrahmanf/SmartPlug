@@ -14,6 +14,7 @@ import android.location.LocationManager
 import android.net.wifi.WifiManager
 import android.net.wifi.ScanResult
 import android.net.wifi.WifiNetworkSpecifier
+import android.os.Build
 import androidx.core.content.ContextCompat
 import androidx.core.location.LocationManagerCompat
 import com.smartplug.app.domain.model.DiscoveredSmartPlugAp
@@ -49,10 +50,16 @@ class WifiOnboardingRepositoryImpl @Inject constructor(
         // ACCESS_FINE_LOCATION on every version, not NEARBY_WIFI_DEVICES on 13+: see the manifest
         // comment — the neverForLocation alternative redacts real SSIDs from scan results, which
         // breaks onboarding's whole "find the AP literally named SP-<unit_id>" premise.
-        return ContextCompat.checkSelfPermission(
+        val hasLocation = ContextCompat.checkSelfPermission(
             context,
             Manifest.permission.ACCESS_FINE_LOCATION,
         ) == PackageManager.PERMISSION_GRANTED
+        val hasNearbyWifi = Build.VERSION.SDK_INT < Build.VERSION_CODES.S ||
+            ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.NEARBY_WIFI_DEVICES,
+            ) == PackageManager.PERMISSION_GRANTED
+        return hasLocation && hasNearbyWifi
     }
 
     override fun isLocationServiceRequiredAndDisabled(): Boolean {
@@ -199,8 +206,18 @@ class WifiOnboardingRepositoryImpl @Inject constructor(
         }
     }
 
-    override suspend fun connectToAp(ssid: String, password: String): Result<Unit> =
-        suspendCancellableCoroutine { continuation ->
+    override suspend fun connectToAp(ssid: String, password: String): Result<Unit> {
+        // Android may already have joined the setup AP (for example after the user accepts
+        // the system Wi-Fi sheet, or after a retry).  Issuing a second WifiNetworkSpecifier
+        // request for that same AP can time out on Samsung/Android 16 even though the device
+        // is connected and its local API is reachable.  Reuse the current Wi-Fi network first.
+        connectedWifiNetworkFor(ssid)?.let { network ->
+            boundNetwork = network
+            connectivityManager.bindProcessToNetwork(network)
+            return Result.success(Unit)
+        }
+
+        return suspendCancellableCoroutine { continuation ->
             val specifier = WifiNetworkSpecifier.Builder()
                 .setSsid(ssid)
                 .setWpa2Passphrase(password)
@@ -243,6 +260,7 @@ class WifiOnboardingRepositoryImpl @Inject constructor(
                 runCatching { connectivityManager.unregisterNetworkCallback(callback) }
             }
         }
+    }
 
 
     override fun releaseApBinding() {
@@ -270,6 +288,22 @@ class WifiOnboardingRepositoryImpl @Inject constructor(
         val network = connectivityManager.activeNetwork ?: return false
         val capabilities = connectivityManager.getNetworkCapabilities(network) ?: return false
         return capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
+    }
+
+    @Suppress("DEPRECATION")
+    private fun connectedWifiNetworkFor(expectedSsid: String): Network? {
+        val connectedSsid = wifiManager.connectionInfo?.ssid
+            ?.removePrefix("\"")
+            ?.removeSuffix("\"")
+            ?: return null
+        if (connectedSsid != expectedSsid) return null
+
+        // The setup AP has no internet, so the default/active network stays cellular. Look
+        // for the Wi-Fi-transport network explicitly instead of trusting activeNetwork.
+        return connectivityManager.allNetworks.firstOrNull { network ->
+            connectivityManager.getNetworkCapabilities(network)
+                ?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
+        }
     }
 
     companion object {

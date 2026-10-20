@@ -39,6 +39,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import android.os.Build
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.smartplug.app.domain.model.DiscoveredSmartPlugAp
@@ -61,8 +62,8 @@ fun AddSmartPlugScreen(
     val context = androidx.compose.ui.platform.LocalContext.current
     val language = LocalAppLanguage.current
 
-    val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-        if (granted) viewModel.onPermissionGranted()
+    val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { granted ->
+        if (granted.values.all { it }) viewModel.onPermissionGranted()
     }
 
     Scaffold(
@@ -85,7 +86,7 @@ fun AddSmartPlugScreen(
         Column(modifier = Modifier.fillMaxSize().padding(padding).padding(16.dp)) {
             if (uiState.permissionMissing) {
                 PermissionRequestContent(onRequest = {
-                    permissionLauncher.launch(requiredWifiPermission())
+                    permissionLauncher.launch(requiredWifiPermissions())
                 })
                 return@Scaffold
             }
@@ -124,7 +125,10 @@ fun AddSmartPlugScreen(
     }
 }
 
-private fun requiredWifiPermission(): String = android.Manifest.permission.ACCESS_FINE_LOCATION
+private fun requiredWifiPermissions(): Array<String> = buildList {
+    add(android.Manifest.permission.ACCESS_FINE_LOCATION)
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) add(android.Manifest.permission.NEARBY_WIFI_DEVICES)
+}.toTypedArray()
 
 @Composable
 private fun PermissionRequestContent(onRequest: () -> Unit) {

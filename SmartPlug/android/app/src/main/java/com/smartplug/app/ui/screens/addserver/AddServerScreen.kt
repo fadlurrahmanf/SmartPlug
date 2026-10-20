@@ -45,6 +45,7 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.unit.dp
+import android.os.Build
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.smartplug.app.domain.model.DiscoveredServerSetupAp
@@ -62,8 +63,8 @@ fun AddServerScreen(onDone: () -> Unit, onBack: () -> Unit, viewModel: AddServer
     val state by viewModel.uiState.collectAsStateWithLifecycle()
     val context = LocalContext.current
     val language = LocalAppLanguage.current
-    val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-        if (granted) { viewModel.refreshPrerequisites(); viewModel.startServerSearch() }
+    val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { granted ->
+        if (granted.values.all { it }) { viewModel.refreshPrerequisites(); viewModel.startServerSearch() }
     }
     Scaffold(topBar = {
         TopAppBar(
@@ -80,7 +81,7 @@ fun AddServerScreen(onDone: () -> Unit, onBack: () -> Unit, viewModel: AddServer
     }) { padding ->
         Column(modifier = Modifier.fillMaxSize().padding(padding).padding(16.dp)) {
             if (state.permissionMissing) {
-                ServerPermissionContent { permissionLauncher.launch(requiredWifiPermission()) }
+                ServerPermissionContent { permissionLauncher.launch(requiredWifiPermissions()) }
                 return@Column
             }
             if (state.locationServiceDisabled) {
@@ -104,7 +105,10 @@ fun AddServerScreen(onDone: () -> Unit, onBack: () -> Unit, viewModel: AddServer
     }
 }
 
-private fun requiredWifiPermission(): String = android.Manifest.permission.ACCESS_FINE_LOCATION
+private fun requiredWifiPermissions(): Array<String> = buildList {
+    add(android.Manifest.permission.ACCESS_FINE_LOCATION)
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) add(android.Manifest.permission.NEARBY_WIFI_DEVICES)
+}.toTypedArray()
 
 @Composable
 private fun ServerPermissionContent(onRequest: () -> Unit) {

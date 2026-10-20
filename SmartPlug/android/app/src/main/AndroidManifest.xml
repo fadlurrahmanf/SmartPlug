@@ -20,6 +20,12 @@
          real SSID visibility during onboarding. -->
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <!-- Android 13+ uses this runtime grant for Wi-Fi local-network access.  It is
+         required by Android 16's Local Network Protection compatibility mode when
+         onboarding talks to the SmartPlug setup AP at 192.168.4.1. -->
+    <uses-permission
+        android:name="android.permission.NEARBY_WIFI_DEVICES"
+        android:usesPermissionFlags="neverForLocation" />
 
     <!-- mDNS/NSD re-discovery of the device or ServerSmartPlug on the home LAN -->
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />

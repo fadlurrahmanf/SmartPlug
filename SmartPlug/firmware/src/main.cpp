@@ -404,6 +404,10 @@ class SmartPlugApi {
   void handlePairScanWifi();
   void handlePairConfigure();
   void handlePairStatus();
+  void handlePairComplete();
+  void handlePairAbort();
+  void expirePendingPairingIfNeeded();
+  void recoverPendingPairing(const char* auditEvent);
   bool requirePairingToken();
   bool requireOwnerTokenBearer();
   bool requireOperationalTokenBearer();
@@ -492,6 +496,10 @@ class SmartPlugApi {
   // response that hands it to the app; EEPROM only ever stores its salted
   // hash (see ownerTokenSalt/ownerTokenHash on PersistentSettings).
   String pairingIssuedOwnerToken_;
+  // An owner credential may be issued before onboarding is fully committed.
+  // Pairing remains resumable only for this session until pair/complete.
+  bool pairingPending_ = false;
+  unsigned long pairingPendingExpiresAtMs_ = 0;
   String accessInviteCode_;
   unsigned long accessInviteExpiresAtMs_ = 0;
   uint8_t accessInviteFailures_ = 0;
@@ -1735,6 +1743,7 @@ constexpr uint8_t kTimerExpiryMaxAttempts = 3U;
 constexpr uint8_t kMaxFailedLogins = 5;
 // design.md: "pairing_token ... berlaku lima menit".
 constexpr unsigned long kPairingTokenLifetimeMs = 5UL * 60UL * 1000UL;
+constexpr unsigned long kPairingPendingLifetimeMs = 5UL * 60UL * 1000UL;
 // Not specified by design.md; generous enough for a real home AP handshake
 // without leaving the app's 1s status poll spinning indefinitely.
 constexpr unsigned long kPairConnectTimeoutMs = 20000UL;
@@ -2770,6 +2779,8 @@ void SmartPlugApi::begin() {
   server_.on("/api/v1/pair/scan-wifi", HTTP_POST, [this]() { handlePairScanWifi(); });
   server_.on("/api/v1/pair/configure", HTTP_POST, [this]() { handlePairConfigure(); });
   server_.on("/api/v1/pair/status", HTTP_GET, [this]() { handlePairStatus(); });
+  server_.on("/api/v1/pair/complete", HTTP_POST, [this]() { handlePairComplete(); });
+  server_.on("/api/v1/pair/abort", HTTP_POST, [this]() { handlePairAbort(); });
   server_.onNotFound([this]() { handleNotFound(); });
   server_.begin();
   webServerStarted_ = true;
@@ -4015,10 +4026,38 @@ bool SmartPlugApi::requireOperationalRead() {
 String SmartPlugApi::pairFailedJson(const char* reason) const {
   return String("{\"api_version\":\"1.0\",\"state\":\"failed\",\"reason\":\"") + reason + "\"}";
 }
+void SmartPlugApi::expirePendingPairingIfNeeded() {
+  if (!pairingPending_ || !reached(pairingPendingExpiresAtMs_)) return;
+  recoverPendingPairing("pairing_pending_timeout");
+}
+void SmartPlugApi::recoverPendingPairing(const char* auditEvent) {
+  // A half-finished phone session must not leave a permanent owner behind.
+  // Keep the Wi-Fi credentials so the owner can recover on the home LAN, but
+  // remove the pending ownership proof and make a fresh pairing possible.
+  pairingPending_ = false;
+  pairingPendingExpiresAtMs_ = 0;
+  pairingToken_ = "";
+  pairingConfigurationId_ = "";
+  pairingIssuedOwnerToken_ = "";
+  persistentSettings.ownerTokenHash[0] = '\0';
+  persistentSettings.ownerTokenSalt[0] = '\0';
+  persistentSettings.stationSsid[0] = '\0';
+  persistentSettings.stationPassword[0] = '\0';
+  configuredStationSsid_ = "";
+  stationConfigured_ = false;
+  saveSettings();
+  credential_vault::clear();
+  // Rebuild the AP immediately; retry never needs a factory reset.
+  WiFi.disconnect(true);
+  startNetwork();
+  addAuditEvent(auditEvent);
+}
 void SmartPlugApi::handlePairInfo() {
   // design.md: "Pairing hanya diterima saat perangkat belum dikonfigurasi."
   // An owner_token only ever exists once a pairing attempt has fully
   // succeeded, so its absence is exactly "still unprovisioned".
+  expirePendingPairingIfNeeded();
+  if (pairingPending_) { sendError(409, "pairing_pending"); return; }
   if (persistentSettings.ownerTokenHash[0] != '\0') { sendError(409, "pairing_closed"); return; }
   if (pairingToken_.isEmpty() || reached(pairingTokenExpiresAtMs_)) {
     pairingToken_ = randomHex(16);
@@ -4034,6 +4073,8 @@ void SmartPlugApi::handlePairInfo() {
   sendJson(200, b);
 }
 void SmartPlugApi::handlePairScanWifi() {
+  expirePendingPairingIfNeeded();
+  if (pairingPending_) { sendError(409, "pairing_pending"); return; }
   if (persistentSettings.ownerTokenHash[0] != '\0') { sendError(409, "pairing_closed"); return; }
   if (!requirePairingToken()) return;
   // Blocking scan: acceptable during setup-only pairing, and ESP8266 can scan
@@ -4058,6 +4099,8 @@ void SmartPlugApi::handlePairScanWifi() {
   sendJson(200, b);
 }
 void SmartPlugApi::handlePairConfigure() {
+  expirePendingPairingIfNeeded();
+  if (pairingPending_) { sendError(409, "pairing_pending"); return; }
   if (persistentSettings.ownerTokenHash[0] != '\0') { sendError(409, "pairing_closed"); return; }
   if (!requirePairingToken()) return;
   const String body = server_.arg("plain");
@@ -4115,11 +4158,15 @@ void SmartPlugApi::handlePairConfigure() {
   WiFi.begin(persistentSettings.stationSsid, persistentSettings.stationPassword);
   pairingConfigurationId_ = "cfg-" + randomHex(8);
   pairingConnectStartedAtMs_ = millis();
+  pairingPending_ = true;
+  pairingPendingExpiresAtMs_ = millis() + kPairingPendingLifetimeMs;
+  pairingTokenExpiresAtMs_ = pairingPendingExpiresAtMs_;
   addAuditEvent("pairing_configure");
   sendJson(202, String("{\"api_version\":\"1.0\",\"configuration_id\":\"") +
                     pairingConfigurationId_ + "\",\"state\":\"connecting\"}");
 }
 void SmartPlugApi::handlePairStatus() {
+  expirePendingPairingIfNeeded();
   if (!requirePairingToken()) return;
   const String configurationId = server_.arg("configuration_id");
   if (pairingConfigurationId_.isEmpty() || configurationId != pairingConfigurationId_) {
@@ -4149,7 +4196,7 @@ void SmartPlugApi::handlePairStatus() {
       pairingIssuedOwnerToken_ = token;
       addAuditEvent("pairing_connected");
     }
-    String b(F("{\"api_version\":\"1.0\",\"state\":\"connected\",\"device_id\":\""));
+    String b(F("{\"api_version\":\"1.0\",\"state\":\"pairing_pending\",\"device_id\":\""));
     b += deviceId();
     b += F("\",\"sta_mac\":\""); b += WiFi.macAddress();
     b += F("\",\"ssid\":\""); b += jsonEscape(configuredStationSsid_);
@@ -4161,17 +4208,53 @@ void SmartPlugApi::handlePairStatus() {
   }
   const unsigned long elapsed = millis() - pairingConnectStartedAtMs_;
   const wl_status_t wifiStatus = WiFi.status();
-  if (wifiStatus == WL_NO_SSID_AVAIL) { sendJson(200, pairFailedJson("wifi_not_found")); return; }
-  if (wifiStatus == WL_CONNECT_FAILED) { sendJson(200, pairFailedJson("wifi_authentication_failed")); return; }
+  if (wifiStatus == WL_NO_SSID_AVAIL) { recoverPendingPairing("pairing_wifi_not_found"); sendJson(200, pairFailedJson("wifi_not_found")); return; }
+  if (wifiStatus == WL_CONNECT_FAILED) { recoverPendingPairing("pairing_wifi_auth_failed"); sendJson(200, pairFailedJson("wifi_authentication_failed")); return; }
   if (wifiConnected && pairingIsServerProfile_ && elapsed > kPairBrokerTimeoutMs) {
-    sendJson(200, pairFailedJson("broker_connection_failed"));
+    recoverPendingPairing("pairing_broker_failed"); sendJson(200, pairFailedJson("broker_connection_failed"));
     return;
   }
   if (!wifiConnected && elapsed > kPairConnectTimeoutMs) {
-    sendJson(200, pairFailedJson("wifi_connection_timeout"));
+    recoverPendingPairing("pairing_wifi_timeout"); sendJson(200, pairFailedJson("wifi_connection_timeout"));
     return;
   }
   sendJson(200, F("{\"api_version\":\"1.0\",\"state\":\"connecting\"}"));
+}
+void SmartPlugApi::handlePairComplete() {
+  expirePendingPairingIfNeeded();
+  if (!pairingPending_) {
+    sendError(409, persistentSettings.ownerTokenHash[0] == '\0' ? "pairing_not_pending" : "pairing_closed");
+    return;
+  }
+  if (!requirePairingToken() || !requireOwnerTokenBearer()) return;
+  if (server_.arg("configuration_id") != pairingConfigurationId_) {
+    sendError(404, "configuration_not_found");
+    return;
+  }
+  // Display-name is written atomically by the authenticated endpoint.  Its
+  // presence is the device-side proof that the app completed the rename step.
+  if (!LittleFS.exists("/display-name.txt")) {
+    sendError(409, "display_name_required");
+    return;
+  }
+  pairingPending_ = false;
+  pairingPendingExpiresAtMs_ = 0;
+  pairingToken_ = "";
+  pairingConfigurationId_ = "";
+  pairingIssuedOwnerToken_ = "";
+  addAuditEvent("pairing_complete");
+  sendJson(200, F("{\"api_version\":\"1.0\",\"state\":\"paired\"}"));
+}
+void SmartPlugApi::handlePairAbort() {
+  expirePendingPairingIfNeeded();
+  if (!pairingPending_) { sendError(409, "pairing_not_pending"); return; }
+  if (!requirePairingToken() || !requireOwnerTokenBearer()) return;
+  if (server_.arg("configuration_id") != pairingConfigurationId_) {
+    sendError(404, "configuration_not_found");
+    return;
+  }
+  recoverPendingPairing("pairing_aborted_by_app");
+  sendJson(200, F("{\"api_version\":\"1.0\",\"state\":\"unprovisioned\"}"));
 }
 bool SmartPlugApi::takeRelayCommand(bool& turnOn) { if (!relayCommandPending_) return false; relayCommandPending_ = false; turnOn = requestedRelayOn_; return true; }
 void SmartPlugApi::handleNotFound() { sendJson(404,"{\"error\":\"not_found\"}"); }
@@ -4551,29 +4634,31 @@ void printMeter() {
 }
 
 void printStatus() {
-  Serial.print(F("{\"firmware\":\""));
+  Serial.println(F("--- SmartPlug info ---"));
+  Serial.print(F("firmware        : "));
   Serial.print(kFirmwareName);
-  Serial.print(F("\",\"version\":\""));
+  Serial.print(F("\nversion         : "));
   Serial.print(build_config::kFirmwareVersion);
-  Serial.print(F("\",\"uptime_ms\":"));
+  Serial.print(F("\nuptime_ms       : "));
   Serial.print(millis());
-  Serial.print(F(",\"relay\":\""));
+  Serial.print(F("\nrelay           : "));
   Serial.print(relay.stateText());
-  Serial.print(F("\",\"relay_actuation_allowed\":"));
+  Serial.print(F("\nrelay_control   : "));
   Serial.print(boolText(relay.actuationAllowed()));
-  Serial.print(F(",\"button_enabled\":"));
+  Serial.print(F("\nbutton_enabled  : "));
   Serial.print(boolText(build_config::kButtonEnabled));
-  Serial.print(F(",\"led_enabled\":"));
+  Serial.print(F("\nled_enabled     : "));
   Serial.print(boolText(build_config::kLedEnabled));
-  Serial.print(F(",\"local_api_enabled\":"));
+  Serial.print(F("\nlocal_api       : "));
   Serial.print(boolText(build_config::kLocalApiEnabled));
-  Serial.print(F(",\"mqtt_enabled\":"));
+  Serial.print(F("\nmqtt             : "));
   Serial.print(boolText(build_config::kMqttEnabled));
-  Serial.println(F("}"));
+  Serial.println(F("\n----------------------"));
 }
 
 void printHelp() {
   Serial.println(F("help"));
+  Serial.println(F("info  (or status)"));
   Serial.println(F("status"));
   Serial.println(F("meter"));
 #if SMARTPLUG_ENABLE_LOCAL_API
@@ -4595,7 +4680,7 @@ void processCommand(const char* command) {
     printHelp();
     return;
   }
-  if (std::strcmp(command, "status") == 0) {
+  if (std::strcmp(command, "status") == 0 || std::strcmp(command, "info") == 0) {
     printStatus();
     return;
   }

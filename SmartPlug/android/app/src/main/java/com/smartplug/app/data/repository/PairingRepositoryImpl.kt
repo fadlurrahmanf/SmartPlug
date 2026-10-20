@@ -80,6 +80,32 @@ class PairingRepositoryImpl @Inject constructor(
     ): ApiResult<PairingStatus> =
         fetchStatus(apiClientFactory.pairingApi(baseUrl), pairingToken, configurationId)
 
+    override suspend fun completePairingAt(
+        baseUrl: String,
+        pairingToken: String,
+        ownerToken: String,
+        configurationId: String,
+    ): ApiResult<Unit> = safeApiCall {
+        apiClientFactory.pairingApi(baseUrl).complete(
+            pairingToken = pairingToken,
+            authorization = "Bearer $ownerToken",
+            configurationId = configurationId,
+        )
+    }.map { Unit }
+
+    override suspend fun abortPairingAt(
+        baseUrl: String,
+        pairingToken: String,
+        ownerToken: String,
+        configurationId: String,
+    ): ApiResult<Unit> = safeApiCall {
+        apiClientFactory.pairingApi(baseUrl).abort(
+            pairingToken = pairingToken,
+            authorization = "Bearer $ownerToken",
+            configurationId = configurationId,
+        )
+    }.map { Unit }
+
     private suspend fun fetchStatus(
         targetApi: com.smartplug.app.data.remote.PairingApi,
         pairingToken: String,
@@ -101,6 +127,7 @@ class PairingRepositoryImpl @Inject constructor(
         "unprovisioned" -> PairingState.UNPROVISIONED
         "pairing" -> PairingState.PAIRING
         "connecting" -> PairingState.CONNECTING
+        "pairing_pending" -> PairingState.PAIRING_PENDING
         "connected" -> PairingState.CONNECTED
         "failed" -> PairingState.FAILED
         else -> PairingState.FAILED

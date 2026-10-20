@@ -13,8 +13,8 @@ android {
         applicationId = "com.smartplug.app"
         minSdk = 29
         targetSdk = 34
-        versionCode = 71
-        versionName = "0.1.70"
+        versionCode = 73
+        versionName = "0.1.72"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables { useSupportLibrary = true }

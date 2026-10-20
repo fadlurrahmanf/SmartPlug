@@ -38,4 +38,18 @@ interface PairingApi {
         @Header("X-Pairing-Token") pairingToken: String,
         @Query("configuration_id") configurationId: String,
     ): Response<PairStatusResponseDto>
+
+    @POST("/api/v1/pair/complete")
+    suspend fun complete(
+        @Header("X-Pairing-Token") pairingToken: String,
+        @Header("Authorization") authorization: String,
+        @Query("configuration_id") configurationId: String,
+    ): Response<Unit>
+
+    @POST("/api/v1/pair/abort")
+    suspend fun abort(
+        @Header("X-Pairing-Token") pairingToken: String,
+        @Header("Authorization") authorization: String,
+        @Query("configuration_id") configurationId: String,
+    ): Response<Unit>
 }
